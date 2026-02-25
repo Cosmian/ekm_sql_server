@@ -1,0 +1,8 @@
+# Build artifacts
+*.dll
+*.lib
+*.exp
+*.obj
+*.res
+*.pdb
+*.ilk

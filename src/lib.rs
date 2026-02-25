@@ -206,10 +206,10 @@ pub extern "C" fn SqlCryptGetProviderInfo(p_provider_info: *mut SqlCpProviderInf
         scp_ver.minor = 1;
         info.scpVersion = scp_ver;
 
-        // Authentication type: "Other" because we authenticate via client
-        // certificate configured in config.toml, not via SQL Server Basic
-        // (username/password) credentials.
-        info.authType = SqlCpAuthType::scp_auth_Other;
+        // Authentication type: Basic (username/password), matching the sample
+        // EKM provider.  SQL Server uses this to decide what credential fields
+        // to collect when callers create a CREDENTIAL FOR CRYPTOGRAPHIC PROVIDER.
+        info.authType = SqlCpAuthType::scp_auth_Basic;
 
         // Symmetric key support: advertise Supported so SQL Server accepts
         // the provider.  Actual symmetric operations return scp_err_NotSupported
@@ -226,15 +226,37 @@ pub extern "C" fn SqlCryptGetProviderInfo(p_provider_info: *mut SqlCpProviderInf
         // We accept an external key name in CreateKey (used for KMS key lookup)
         info.fAcceptsKeyName = 1; // TRUE
 
+        // --- Diagnostic: hex dump of the entire struct for byte-level analysis ---
+        let struct_bytes = std::slice::from_raw_parts(
+            p_provider_info as *const u8,
+            size_of::<SqlCpProviderInfo>(),
+        );
+        let hex: String = struct_bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if i > 0 && i % 16 == 0 {
+                    format!("\n  {:02x}", b)
+                } else {
+                    format!(" {:02x}", b)
+                }
+            })
+            .collect();
         info!(
+            struct_size = size_of::<SqlCpProviderInfo>(),
             name_cb = info.name.cb,
-            symm_key_support = info.symmKeySupport,
-            asymm_key_support = info.asymmKeySupport,
-            cb_key_thumb_len = info.cbKeyThumbLen,
-            scp_ver_major = info.scpVersion.major,
-            scp_ver_minor = info.scpVersion.minor,
+            name_ws_ptr = ?info.name.ws,
+            guid_data1 = format_args!("0x{:08X}", info.guid.Data1),
+            version = format_args!("{}.{}.{}.{}", info.version.major, info.version.minor, info.version.build, info.version.revision),
+            scp_version = format_args!("{}.{}.{}.{}", info.scpVersion.major, info.scpVersion.minor, info.scpVersion.build, info.scpVersion.revision),
+            auth_type = ?info.authType,
+            symm = info.symmKeySupport,
+            asymm = info.asymmKeySupport,
+            thumb_len = info.cbKeyThumbLen,
+            accepts_key_name = info.fAcceptsKeyName,
             "SqlCryptGetProviderInfo struct populated"
         );
+        info!(hex = %hex, "SqlCpProviderInfo raw bytes");
     }
     scp_err_Success
 }
