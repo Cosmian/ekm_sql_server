@@ -192,48 +192,55 @@ SqlCryptCloseSession(SqlCpSession *pSess, BOOLEAN fAbort)
 
 // -- Provider info ---------------------------------------------------------
 
+// Global const provider info, following the Microsoft USBCryptoProvider pattern
+static const SqlCpProviderInfo x_providerInfo = {
+    {(ULONG)(19 * sizeof(WCHAR)), NULL},                                            // name: cb=38, ws set at runtime
+    {0xC05A1A00, 0x1001, 0x4001, {0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}}, // guid
+    {1, 0, 0, 0},                                                                   // version
+    {1, 1, 0, 0},                                                                   // scpVersion
+    scp_auth_Basic,                                                                 // authType
+    (SqlCpKeyFlags)(scp_kf_Supported),                                              // symmKeySupport
+    (SqlCpKeyFlags)(scp_kf_Supported),                                              // asymmKeySupport
+    sizeof(GUID),                                                                   // cbKeyThumbLen = 16
+    TRUE                                                                            // fAcceptsKeyName
+};
+
 __declspec(dllexport) SqlCpError __cdecl
 SqlCryptGetProviderInfo(SqlCpProviderInfo *pProviderInfo)
 {
+    ULONG cbNameRequired;
+    WCHAR *pwsCallerBuf;
+
     if (!pProviderInfo)
         return scp_err_InvalidArgument;
 
-    ZeroMemory(pProviderInfo, sizeof(SqlCpProviderInfo));
+    // The name byte-count for "Test C EKM Provider" (19 chars, no null)
+    cbNameRequired = (ULONG)(wcslen(wsProviderName) * sizeof(WCHAR));
 
-    // Provider friendly name (SqlCpStr: cb = byte count, ws = pointer)
-    pProviderInfo->name.cb = (ULONG)(wcslen(wsProviderName) * sizeof(WCHAR));
-    pProviderInfo->name.ws = wsProviderName;
+    // Two-call buffer-negotiation protocol (matches Microsoft USBCryptoProvider):
+    //   Call 1: SQL Server passes name.ws = NULL / name.cb = 0.
+    //           Provider sets name.cb = required size and returns InsufficientBuffer.
+    //   Call 2: SQL Server passes name.ws = allocated buffer, name.cb = buffer size.
+    //           Provider copies data into the caller's buffer.
+    if (pProviderInfo->name.cb < cbNameRequired || pProviderInfo->name.ws == NULL)
+    {
+        pProviderInfo->name.cb = cbNameRequired;
+        return scp_err_InsufficientBuffer;
+    }
 
-    // Stable GUID  {C05A1A00-1001-4001-8001-000000000001}
-    pProviderInfo->guid.Data1 = 0xC05A1A00;
-    pProviderInfo->guid.Data2 = 0x1001;
-    pProviderInfo->guid.Data3 = 0x4001;
-    pProviderInfo->guid.Data4[0] = 0x80;
-    pProviderInfo->guid.Data4[1] = 0x01;
-    pProviderInfo->guid.Data4[2] = 0x00;
-    pProviderInfo->guid.Data4[3] = 0x00;
-    pProviderInfo->guid.Data4[4] = 0x00;
-    pProviderInfo->guid.Data4[5] = 0x00;
-    pProviderInfo->guid.Data4[6] = 0x00;
-    pProviderInfo->guid.Data4[7] = 0x01;
+    // Save the caller's name buffer pointer before overwriting the struct
+    pwsCallerBuf = pProviderInfo->name.ws;
 
-    // Provider DLL version (matches PE VERSIONINFO)
-    pProviderInfo->version.major = 1;
-    pProviderInfo->version.minor = 0;
-    pProviderInfo->version.build = 0;
-    pProviderInfo->version.revision = 0;
+    // Copy the entire struct (overwrites name.ws with x_providerInfo's value)
+    memcpy(pProviderInfo, &x_providerInfo, sizeof(SqlCpProviderInfo));
 
-    // SQL Crypto API version (must be 1.1 per sqlcrypt.h)
-    pProviderInfo->scpVersion.major = 1;
-    pProviderInfo->scpVersion.minor = 1;
-    pProviderInfo->scpVersion.build = 0;
-    pProviderInfo->scpVersion.revision = 0;
-
-    pProviderInfo->authType = scp_auth_Basic;
-    pProviderInfo->symmKeySupport = scp_kf_Supported;
-    pProviderInfo->asymmKeySupport = scp_kf_Supported;
-    pProviderInfo->cbKeyThumbLen = sizeof(GUID); // 16
-    pProviderInfo->fAcceptsKeyName = TRUE;
+    // Restore the caller's buffer pointer and copy the name string into it
+    pProviderInfo->name.ws = pwsCallerBuf;
+    pProviderInfo->name.cb = cbNameRequired;
+    if (cbNameRequired)
+    {
+        memcpy(pProviderInfo->name.ws, wsProviderName, cbNameRequired);
+    }
 
     return scp_err_Success;
 }

@@ -1,0 +1,21 @@
+LIBRARY	"IngrianSqlProv.dll"
+VERSION 1.1
+EXPORTS
+	SqlCryptInitializeProvider
+	SqlCryptFreeProvider
+	SqlCryptOpenSession
+	SqlCryptCloseSession
+	SqlCryptGetProviderInfo
+	SqlCryptGetNextAlgorithmId
+	SqlCryptGetAlgorithmInfo
+	SqlCryptCreateKey
+	SqlCryptDropKey
+	SqlCryptGetNextKeyId
+	SqlCryptGetKeyInfoByKeyId
+	SqlCryptGetKeyInfoByThumb
+	SqlCryptGetKeyInfoByName
+	SqlCryptExportKey
+	SqlCryptImportKey
+	SqlCryptEncrypt
+	SqlCryptDecrypt
+	
