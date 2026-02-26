@@ -1,0 +1,2 @@
+{"rule":"QB_NEW_EN_DASH_RULE_EM","sentence":"^\\QStep 8.1 - Enable EKM support (server option)\\E$"}
+{"rule":"QB_NEW_EN_OTHER","sentence":"^\\QStep 8.2 - Register the Cosmian EKM DLL as a cryptographic provider\\E$"}

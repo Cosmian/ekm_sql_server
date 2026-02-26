@@ -4,7 +4,7 @@
 
 `CREATE CRYPTOGRAPHIC PROVIDER` fails with:
 
-```
+```text
 Msg 33029, Level 16, State 2, Server DESKTOP-7KE1EPJ, Line 1
 Cannot initialize cryptographic provider. Provider error code: 0.
 (Success - Consult EKM Provider for details)

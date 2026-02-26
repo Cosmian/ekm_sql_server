@@ -1,0 +1,2 @@
+[env]
+OPENSSL_DIR = "C:\\Users\\bgrieder\\projects\\vcpkg_installed\\vcpkg\\pkgs\\openssl_x64-windows-static"

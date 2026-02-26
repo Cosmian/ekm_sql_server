@@ -34,6 +34,23 @@ The library exposes the `SqlCrypt*` C ABI required by SQL Server and is built as
 | A code-signing certificate | Self-signed is fine for dev; must be trusted by the machine. |
 | SQL Server Developer / Enterprise edition | EKM is **not** available in Express or Web editions. |
 | `sqlcmd` or SQL Server Management Studio | To execute T-SQL commands. |
+| OpenSSL | See instructions below |
+
+### Installing OpenSSL with vcpkg
+
+Follow the prerequisites below, or use the provided PowerShell helpers.
+
+Prerequisites (manual):
+
+1. Install Visual Studio (C++ workload + clang), Strawberry Perl, and `vcpkg`.
+2. Install OpenSSL 3.6.0 with vcpkg:
+
+In this project root directory, run:
+
+```powershell
+vcpkg install --triplet x64-windows-static 
+$env:OPENSSL_DIR=(Get-Item .).FullName+"\vcpkg_installed\vcpkg\pkgs\openssl_x64-windows-static"
+```
 
 ---
 
@@ -175,6 +192,7 @@ What it does:
 2. Stops the SQL Server service.
 3. Overwrites `C:\Program Files\Cosmian\EKM\cosmian_ekm_sql_server.dll`.
 4. Restarts SQL Server and waits until it is running.
+5. Re-runs the `CREATE CRYPTOGRAPHIC PROVIDER` statement to update the DLL path in SQL Server's catalog (see [Section 8.2](#step-82---register-the-cosmian-ekm-dll-as-a-cryptographic-provider)).
 
 > **Do I need to re-register the provider after updating the DLL?**  
 > **No.** `CREATE CRYPTOGRAPHIC PROVIDER` is a one-time operation that records the
@@ -201,6 +219,12 @@ If SQL Server is not yet installed or you want to restart it yourself:
 .\scripts\Deploy-EkmDll.ps1 -SkipServiceRestart
 ```
 
+If the provider is already registered and you only want to update the DLL without re-running `CREATE CRYPTOGRAPHIC PROVIDER`:
+
+```powershell
+.\scripts\Deploy-EkmDll.ps1 -SkipRegistration
+```
+
 ### Full release workflow (summary)
 
 ```powershell
@@ -210,8 +234,11 @@ cargo build --release
 # 2. Sign
 .\scripts\Sign-EkmDll.ps1
 
-# 3. Deploy (stops SQL Server, copies DLL, restarts SQL Server)
+# 3.a Deploy (stops SQL Server, copies DLL, restarts SQL Server, re-registers the provider)
 .\scripts\Deploy-EkmDll.ps1
+
+# 3.b Deploy (once the provider is successfully registered, and a credential has been created for the Database Engine login, you must skip the provider registration step on subsequent deployments)
+.\scripts\Deploy-EkmDll.ps1 -SkipRegistration
 ```
 
 ---
@@ -358,9 +385,13 @@ GO
 ### Step 8.2 - Register the Cosmian EKM DLL as a cryptographic provider
 
 ```sql
-CREATE CRYPTOGRAPHIC PROVIDER CosmianEKM
-    FROM FILE = 'C:\Program Files\Cosmian\EKM\cosmian_ekm_sql_server.dll';
+IF EXISTS (SELECT 1 FROM sys.cryptographic_providers WHERE name='CosmianEKM') DROP CRYPTOGRAPHIC PROVIDER CosmianEKM;
+CREATE CRYPTOGRAPHIC PROVIDER CosmianEKM FROM FILE = 'C:\Program Files\Cosmian\EKM\cosmian_ekm_sql_server.dll';
 GO
+```
+
+```powershell
+sqlcmd -S localhost -E -Q "CREATE CRYPTOGRAPHIC PROVIDER CosmianEKM FROM FILE = 'C:\Program Files\Cosmian\EKM\cosmian_ekm_sql_server.dll';"
 ```
 
 > **If this statement returns `Msg 33029`:** The provider is *not* registered —
@@ -395,15 +426,11 @@ match the KMS authentication scheme you configure in `config.toml`.
 
 ```sql
 -- Credential used by the sysadmin who will create keys
-CREATE CREDENTIAL Cosmian_Admin_Cred
-    WITH IDENTITY = 'CosmianKMSUser',
-         SECRET   = '<kms-password-or-token>'
-    FOR CRYPTOGRAPHIC PROVIDER CosmianEKM;
+CREATE CREDENTIAL Cosmian_Admin WITH IDENTITY = 'CosmianKMS', SECRET = 'secret' FOR CRYPTOGRAPHIC PROVIDER CosmianEKM;
 GO
 
--- Map the credential to your login (replace DOMAIN\YourLogin as appropriate)
-ALTER LOGIN [DOMAIN\YourLogin]
-    ADD CREDENTIAL Cosmian_Admin_Cred;
+-- Map the credential to your login (replace DOMAIN\YourLogin as appropriate e.g. DESKTOP-7G2ABC\Alice)
+ALTER LOGIN [DOMAIN\YourLogin] ADD CREDENTIAL Cosmian_Admin;
 GO
 ```
 
@@ -413,10 +440,7 @@ GO
 USE master;
 GO
 
-CREATE ASYMMETRIC KEY Cosmian_MasterKey
-    FROM PROVIDER CosmianEKM
-    WITH ALGORITHM         = RSA_2048,
-         PROVIDER_KEY_NAME = 'cosmian-sql-master-key';
+CREATE ASYMMETRIC KEY Cosmian_MasterKey FROM PROVIDER CosmianEKM WITH ALGORITHM = RSA_2048 , PROVIDER_KEY_NAME = 'cosmian-sql-master-key' , CREATION_DISPOSITION = CREATE_NEW;
 GO
 ```
 

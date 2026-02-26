@@ -26,6 +26,9 @@
     If set, the SQL Server service is NOT stopped/restarted.
     Useful if you want to restart manually or SQL Server is not yet registered.
 
+.PARAMETER SkipRegistration
+    If set, the script will NOT attempt to re-register the provider in SQL Server.
+
 .NOTES
     Requires an elevated (Run as Administrator) PowerShell session.
     Run from the repository root directory.
@@ -34,7 +37,8 @@
 param(
     [string]$DllPath          = "target\release\cosmian_ekm_sql_server.dll",
     [string]$SqlServiceName   = "MSSQLSERVER",
-    [switch]$SkipServiceRestart
+    [switch]$SkipServiceRestart,
+    [switch]$SkipRegistration
 )
 
 Set-StrictMode -Version Latest
@@ -48,7 +52,7 @@ $fullDllPath = Join-Path $repoRoot $DllPath
 # ---------------------------------------------------------------------------
 # 1. Pre-flight: check the source DLL exists and has a valid signature
 # ---------------------------------------------------------------------------
-Write-Host "[1/5] Checking source DLL..."
+Write-Host "[1/6] Checking source DLL..."
 if (-not (Test-Path $fullDllPath)) {
     Write-Error "DLL not found: $fullDllPath`nRun 'cargo build --release' then Sign-EkmDll.ps1 first."
 }
@@ -63,7 +67,7 @@ Write-Host "    Signer    : $($sig.SignerCertificate.Subject)"
 # ---------------------------------------------------------------------------
 # 2. Check that the install directory exists
 # ---------------------------------------------------------------------------
-Write-Host "[2/5] Checking install directory..."
+Write-Host "[2/6] Checking install directory..."
 if (-not (Test-Path $installDir)) {
     Write-Error "Install directory '$installDir' does not exist.`nRun Initialize-EkmEnvironment.ps1 first."
 }
@@ -73,10 +77,10 @@ Write-Host "    OK: $installDir"
 # 3. Stop SQL Server
 # ---------------------------------------------------------------------------
 if ($SkipServiceRestart) {
-    Write-Host "[3/5] Skipping SQL Server stop (SkipServiceRestart set)."
+    Write-Host "[3/6] Skipping SQL Server stop (SkipServiceRestart set)."
 }
 else {
-    Write-Host "[3/5] Stopping SQL Server service '$SqlServiceName'..."
+    Write-Host "[3/6] Stopping SQL Server service '$SqlServiceName'..."
     $svc = Get-Service -Name $SqlServiceName -ErrorAction SilentlyContinue
     if (-not $svc) {
         Write-Error "Service '$SqlServiceName' not found. Check the service name or use -SkipServiceRestart."
@@ -92,7 +96,7 @@ else {
 # ---------------------------------------------------------------------------
 # 4. Copy the DLL
 # ---------------------------------------------------------------------------
-Write-Host "[4/5] Copying DLL to '$destDll'..."
+Write-Host "[4/6] Copying DLL to '$destDll'..."
 Copy-Item -Path $fullDllPath -Destination $destDll -Force
 Write-Host "    Done."
 
@@ -100,10 +104,10 @@ Write-Host "    Done."
 # 5. Start SQL Server
 # ---------------------------------------------------------------------------
 if ($SkipServiceRestart) {
-    Write-Host "[5/5] Skipping SQL Server start (SkipServiceRestart set)."
+    Write-Host "[5/6] Skipping SQL Server start (SkipServiceRestart set)."
 }
 else {
-    Write-Host "[5/5] Starting SQL Server service '$SqlServiceName'..."
+    Write-Host "[5/6] Starting SQL Server service '$SqlServiceName'..."
     Start-Service -Name $SqlServiceName
     $svc = Get-Service -Name $SqlServiceName
     $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
@@ -115,4 +119,17 @@ Write-Host "[OK] Deployment complete."
 Write-Host "     DLL installed at: $destDll"
 if (-not $SkipServiceRestart) {
     Write-Host "     SQL Server is running."
+}
+
+# ---------------------------------------------------------------------------
+# 6. Rec-register the provider in SQL Server
+# ---------------------------------------------------------------------------
+if ($SkipRegistration) {
+    Write-Host "[6/6] Skipping SQL Server provider (re)registration (SkipRegistration set)."
+}
+else {
+    Write-Host "[6/6] Re-registering the cryptographic provider in SQL Server..."
+    sqlcmd -S localhost -E -Q "IF EXISTS (SELECT 1 FROM sys.cryptographic_providers WHERE name='CosmianEKM') DROP CRYPTOGRAPHIC PROVIDER CosmianEKM;"
+    sqlcmd -S localhost -E -Q "CREATE CRYPTOGRAPHIC PROVIDER CosmianEKM FROM FILE = '$destDll';"
+    Write-Host "    Done."
 }
