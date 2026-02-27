@@ -290,7 +290,7 @@ client_key  = 'C:\ProgramData\Cosmian\EKM\client.key'
 
 Rolling daily log files are written automatically to:
 
-```
+```powershell
 C:\ProgramData\Cosmian\EKM\logs\cosmian_ekm.log.<yyyy-MM-dd>
 ```
 
@@ -359,7 +359,17 @@ sqlcmd -S localhost -E -i setup.sql
 >
 > Or install the standalone [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility).
 
----
+> **(Re)adding your login to `sysadmin` role**
+> If your current Windows login is not a member of `sysadmin`, you can add it using an elevated PowerShell prompt and the Dedicated Administrator Connection (DAC):
+>
+> ```powershell
+> # 1. Connect via DAC and re-add your Windows login as sysadmin
+> sqlcmd -S admin:localhost -E -Q "
+> CREATE LOGIN [<YOUR_DOMAIN>\<YOUR_LOGIN>] FROM WINDOWS;
+> ALTER SERVER ROLE sysadmin ADD MEMBER [<YOUR_DOMAIN>\<YOUR_LOGIN>];
+> GO
+> "
+> ```
 
 ## 8. Installing the EKM provider in SQL Server
 
@@ -478,6 +488,7 @@ GO
 > JOIN sys.credentials                  c   ON c.credential_id = spc.credential_id
 > WHERE c.name = 'Cosmian_Admin';  -- replace with your credential name
 > GO
+> ```
 
 ### Step 8.4 - Create an asymmetric key inside the EKM provider
 

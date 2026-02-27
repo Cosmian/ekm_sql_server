@@ -7,7 +7,11 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-cosmian_cli = "1.9"
+cosmian_kms_client = "5.16"
+cosmian_http_client = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+openssl = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
@@ -16,3 +20,7 @@ tracing-appender = "0.2"
 
 [build-dependencies]
 bindgen = "0.71"
+
+[[bin]]
+name = "generate-certs"
+path = "tools/generate_certs.rs"

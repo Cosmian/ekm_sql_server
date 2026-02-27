@@ -1,0 +1,40 @@
+# Cosmian EKM Provider — Example Configuration
+#
+# Copy this file to:
+#   %PROGRAMDATA%\Cosmian\EKM\config.toml
+# (typically C:\ProgramData\Cosmian\EKM\config.toml)
+
+# ── Session settings ────────────────────────────────────────────────────────
+
+# Maximum number of seconds a session can be idle before it is considered
+# stale.  Every access resets the TTL clock.
+# Default: 1800 (30 minutes)
+max_age_seconds = 1800
+
+# How often (in seconds) the background stale-session collector thread
+# wakes to bulk-evict expired sessions.
+# Default: 120 (2 minutes)
+stale_collector_period_seconds = 120
+
+# ── Cosmian KMS connection ──────────────────────────────────────────────────
+
+[kms]
+# Base URL of the Cosmian KMS REST API.
+server_url = "https://kms.example.com:9998"
+
+# Accept self-signed / invalid server certificates.
+# Only enable for development!
+accept_invalid_certs = false
+
+# ── Per-user mTLS client certificates ───────────────────────────────────────
+#
+# Each [[kms.certificates]] entry maps a SQL Server login name to a PEM
+# client certificate + key pair.  The certificate's Subject CN (or SAN)
+# must match the username (case-insensitive).
+#
+# Add one section per SQL Server login that needs to create / manage keys.
+
+[[kms.certificates]]
+username    = "admin"
+client_cert = "C:\\ProgramData\\Cosmian\\EKM\\certificates\\admin.cert.pem"
+client_key  = "C:\\ProgramData\\Cosmian\\EKM\\certificates\\admin.key.pem"
