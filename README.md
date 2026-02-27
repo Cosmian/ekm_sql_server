@@ -434,6 +434,51 @@ ALTER LOGIN [DOMAIN\YourLogin] ADD CREDENTIAL Cosmian_Admin;
 GO
 ```
 
+> **Removing the credential mapping:**
+>
+> Remove the mapping to your login:
+>
+> ```sql
+> ALTER LOGIN [DOMAIN\YourLogin] DROP CREDENTIAL Cosmian_Admin;
+> GO
+> ```
+>
+> Drop the credential itself:
+>
+> ```sql
+> DROP CREDENTIAL Cosmian_Admin;
+> GO
+> ```
+
+> **Listing all the credentials**
+>
+> ```sql
+> -- All credentials targeting an EKM provider
+> SELECT
+>     credential_id,
+>     name,
+>     credential_identity,
+>     target_id,
+>     target_type,
+>     create_date
+> FROM sys.credentials
+> WHERE target_type = 'CRYPTOGRAPHIC PROVIDER';
+> GO
+>```
+>
+> ```sql
+> -- All credentials mapped to a specific login
+> SELECT
+>     sp.name             AS login_name,
+>     sp.type_desc        AS login_type,
+>     c.name              AS credential_name,
+>     c.credential_identity
+> FROM sys.server_principal_credentials spc
+> JOIN sys.server_principals            sp  ON sp.principal_id = spc.principal_id
+> JOIN sys.credentials                  c   ON c.credential_id = spc.credential_id
+> WHERE c.name = 'Cosmian_Admin';  -- replace with your credential name
+> GO
+
 ### Step 8.4 - Create an asymmetric key inside the EKM provider
 
 ```sql

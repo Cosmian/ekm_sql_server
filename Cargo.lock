@@ -936,6 +936,8 @@ version = "0.1.0"
 dependencies = [
  "bindgen",
  "cosmian_cli",
+ "serde",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

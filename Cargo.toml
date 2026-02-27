@@ -8,6 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cosmian_cli = "1.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
