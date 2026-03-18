@@ -1,29 +1,78 @@
-# cosmian_ekm_sql_server
+<h1>cosmian_ekm_sql_server</h1>
 
 A Windows DLL implementing the [SQL Server Extensible Key Management (EKM)](https://learn.microsoft.com/en-us/sql/relational-databases/security/encryption/extensible-key-management-ekm?view=sql-server-ver17) provider interface, backed by the [Cosmian KMS](https://github.com/Cosmian/kms).
 
 The library exposes the `SqlCrypt*` C ABI required by SQL Server and is built as a `cdylib` (a Windows `.dll`).
 
----
+If you are only interested in deploying the DLL, check the [Deployment Instructions](DEPLOY.md).
 
-## Table of Contents
+For a high-level overview of the architecture and call flows, see [FLOWS.md](FLOWS.md).
 
-1. [Prerequisites](#prerequisites)
-2. [Building the DLL](#building-the-dll)
-3. [Signing the DLL](#signing-the-dll) <- **required by SQL Server**
-4. [Deploying files and setting permissions](#deploying-files-and-setting-permissions)
-5. [Configuration file (`config.toml`)](#configuration-file-configtoml)
-6. [Log files](#log-files)
-7. [Connecting to SQL Server with `sqlcmd`](#connecting-to-sql-server-with-sqlcmd)
-8. [Installing the EKM provider in SQL Server](#installing-the-ekm-provider-in-sql-server)
-9. [Starting / restarting SQL Server](#starting--restarting-sql-server)
-10. [Creating a test database and testing encryption](#creating-a-test-database-and-testing-encryption)
-11. [Uninstalling the provider](#uninstalling-the-provider)
-12. [Troubleshooting](#troubleshooting)
+For development and testing, see below.
 
 ---
 
-## 1. Prerequisites
+**Table of Contents**
+
+- [1. Build Prerequisites](#1-build-prerequisites)
+  - [Installing OpenSSL with vcpkg](#installing-openssl-with-vcpkg)
+- [2. Building the DLL](#2-building-the-dll)
+  - [Debug build (development only)](#debug-build-development-only)
+  - [Release build (recommended for installation)](#release-build-recommended-for-installation)
+- [3. Signing the DLL](#3-signing-the-dll)
+  - [Step 3a - Create and trust the certificate (`scripts\New-EkmCertificate.ps1`)](#step-3a---create-and-trust-the-certificate-scriptsnew-ekmcertificateps1)
+  - [Step 3b - Sign the DLL (`scripts\Sign-EkmDll.ps1`)](#step-3b---sign-the-dll-scriptssign-ekmdllps1)
+  - [Option B - Certificate issued by a CA already trusted by the machine](#option-b---certificate-issued-by-a-ca-already-trusted-by-the-machine)
+- [4. Deploying files and setting permissions](#4-deploying-files-and-setting-permissions)
+  - [Step 4a - Initial setup (`scripts\Initialize-EkmEnvironment.ps1`)](#step-4a---initial-setup-scriptsinitialize-ekmenvironmentps1)
+  - [Step 4b - Redeploy a new DLL version (`scripts\Deploy-EkmDll.ps1`)](#step-4b---redeploy-a-new-dll-version-scriptsdeploy-ekmdllps1)
+  - [Full release workflow (summary)](#full-release-workflow-summary)
+- [5. Configuration file (`config.toml`)](#5-configuration-file-configtoml)
+  - [Example `config.toml`](#example-configtoml)
+- [6. Log files](#6-log-files)
+- [7. Connecting to SQL Server with `sqlcmd`](#7-connecting-to-sql-server-with-sqlcmd)
+  - [Default instance, Windows authentication (recommended)](#default-instance-windows-authentication-recommended)
+  - [Named instance](#named-instance)
+  - [SQL Server authentication (if Windows auth is not available)](#sql-server-authentication-if-windows-auth-is-not-available)
+  - [Running a T-SQL file directly from the shell](#running-a-t-sql-file-directly-from-the-shell)
+  - [At the `sqlcmd` prompt](#at-the-sqlcmd-prompt)
+- [8. Installing the EKM provider in SQL Server](#8-installing-the-ekm-provider-in-sql-server)
+  - [Step 8.1 - Enable EKM support (server option)](#step-81---enable-ekm-support-server-option)
+  - [Step 8.2 - Register the Cosmian EKM DLL as a cryptographic provider](#step-82---register-the-cosmian-ekm-dll-as-a-cryptographic-provider)
+  - [Step 8.3 - Create a credential for the provider](#step-83---create-a-credential-for-the-provider)
+  - [Step 8.4 - Create an asymmetric key inside the EKM provider](#step-84---create-an-asymmetric-key-inside-the-ekm-provider)
+  - [Step 8.5 - Create a SQL Server login backed by the asymmetric key](#step-85---create-a-sql-server-login-backed-by-the-asymmetric-key)
+- [9. Starting / restarting SQL Server](#9-starting--restarting-sql-server)
+  - [Using PowerShell (elevated)](#using-powershell-elevated)
+  - [Using SQL Server Configuration Manager (GUI)](#using-sql-server-configuration-manager-gui)
+  - [Check service status](#check-service-status)
+- [10. Creating a test database and testing encryption](#10-creating-a-test-database-and-testing-encryption)
+  - [Step 10.1 - Create the test database](#step-101---create-the-test-database)
+  - [Step 10.2 - Create the database master key](#step-102---create-the-database-master-key)
+  - [Step 10.3 - Enable Transparent Data Encryption (TDE) with the EKM key](#step-103---enable-transparent-data-encryption-tde-with-the-ekm-key)
+  - [Step 10.4 - Create a symmetric key for column-level encryption](#step-104---create-a-symmetric-key-for-column-level-encryption)
+  - [Step 10.5 - Create a test table and insert encrypted data](#step-105---create-a-test-table-and-insert-encrypted-data)
+  - [Step 10.6 - Read back the decrypted data](#step-106---read-back-the-decrypted-data)
+- [11. Uninstalling the provider](#11-uninstalling-the-provider)
+- [12. Troubleshooting](#12-troubleshooting)
+  - [Msg 33029 - Cannot initialize cryptographic provider. Provider error code: 3 (Not Supported)](#msg-33029---cannot-initialize-cryptographic-provider-provider-error-code-3-not-supported)
+  - [Msg 33029 - Cannot initialize cryptographic provider. Provider error code: 0 (Success)](#msg-33029---cannot-initialize-cryptographic-provider-provider-error-code-0-success)
+  - [Msg 33029 - Provider error code: 1 (Failure) or signature-related](#msg-33029---provider-error-code-1-failure-or-signature-related)
+  - [Execution policy error when running scripts](#execution-policy-error-when-running-scripts)
+  - [No log file appears](#no-log-file-appears)
+  - [How to check which provider functions were called](#how-to-check-which-provider-functions-were-called)
+- [13. Running the integration tests](#13-running-the-integration-tests)
+  - [Prerequisites](#prerequisites)
+  - [Step 1 - Set your Windows login name](#step-1---set-your-windows-login-name)
+  - [Step 2 - Prepare the test environment](#step-2---prepare-the-test-environment)
+  - [Step 3 - Run the tests](#step-3---run-the-tests)
+  - [Notes](#notes)
+- [Project structure](#project-structure)
+- [License](#license)
+
+---
+
+## 1. Build Prerequisites
 
 | Tool | Notes |
 |---|---|
@@ -256,25 +305,41 @@ Create this file **before** starting SQL Server.
 ### Example `config.toml`
 
 ```toml
-# URL of the Cosmian KMS REST API
-kms_url = "https://kms.example.com:9998"
+# ── Session settings ──────────────────────────────────────────────────────────
+# Maximum session idle time in seconds (default: 1800 = 30 minutes).
+max_age_seconds = 1800
 
-# Path to the PEM-encoded client certificate for mutual TLS authentication
-client_cert = 'C:\ProgramData\Cosmian\EKM\client.pem'
+# ── Cosmian KMS connection ────────────────────────────────────────────────────
+[kms]
+# Base URL of the Cosmian KMS REST API.
+server_url = "https://kms.example.com:9998"
 
-# Path to the matching private key
-client_key = 'C:\ProgramData\Cosmian\EKM\client.key'
+# Set to true only for development / self-signed KMS certificates.
+accept_invalid_certs = false
 
-# Optional: custom CA bundle to trust (PEM)
-# ca_cert = 'C:\ProgramData\Cosmian\EKM\ca.pem'
+# ── Per-user mTLS client certificates ─────────────────────────────────────────
+# One section per SQL Server login that needs to create or manage keys.
+# The certificate's Subject CN (or SAN) must match the username field.
+
+[[kms.certificates]]
+username    = "admin"
+client_cert = 'C:\ProgramData\Cosmian\EKM\certificates\admin.cert.pem'
+client_key  = 'C:\ProgramData\Cosmian\EKM\certificates\admin.key.pem'
 ```
 
 ```powershell
 # Create a minimal config (edit values before use)
 @"
-kms_url     = "https://kms.example.com:9998"
-client_cert = 'C:\ProgramData\Cosmian\EKM\client.pem'
-client_key  = 'C:\ProgramData\Cosmian\EKM\client.key'
+max_age_seconds = 1800
+
+[kms]
+server_url = "https://kms.example.com:9998"
+accept_invalid_certs = false
+
+[[kms.certificates]]
+username    = "admin"
+client_cert = 'C:\ProgramData\Cosmian\EKM\certificates\admin.cert.pem'
+client_key  = 'C:\ProgramData\Cosmian\EKM\certificates\admin.key.pem'
 "@ | Set-Content "C:\ProgramData\Cosmian\EKM\config.toml" -Encoding UTF8
 ```
 
@@ -436,7 +501,8 @@ match the KMS authentication scheme you configure in `config.toml`.
 
 ```sql
 -- Credential used by the sysadmin who will create keys
-CREATE CREDENTIAL Cosmian_Admin WITH IDENTITY = 'CosmianKMS', SECRET = 'secret' FOR CRYPTOGRAPHIC PROVIDER CosmianEKM;
+-- IDENTITY must match the `username` field in a [[kms.certificates]] entry in config.toml.
+CREATE CREDENTIAL Cosmian_Admin WITH IDENTITY = 'admin', SECRET = 'unused' FOR CRYPTOGRAPHIC PROVIDER CosmianEKM;
 GO
 
 -- Map the credential to your login (replace DOMAIN\YourLogin as appropriate e.g. DESKTOP-7G2ABC\Alice)
@@ -511,9 +577,10 @@ CREATE LOGIN EKM_DBEngine_Login
 GO
 
 -- Create a second credential for the Database Engine login
+-- IDENTITY must match the `username` field in a [[kms.certificates]] entry in config.toml.
 CREATE CREDENTIAL Cosmian_DBEngine_Cred
-    WITH IDENTITY = 'CosmianKMSUser',
-         SECRET   = '<kms-password-or-token>'
+    WITH IDENTITY = 'admin',
+         SECRET   = 'unused'
     FOR CRYPTOGRAPHIC PROVIDER CosmianEKM;
 GO
 
@@ -846,9 +913,90 @@ function before the error is where execution stopped.
 
 ---
 
+## 13. Running the integration tests
+
+The integration tests exercise the **deployed DLL** end-to-end through `sqlcmd`
+against a live SQL Server instance and a running Cosmian KMS.  Everything runs
+sequentially because the tests share global SQL Server state.
+
+For a full list of test cases see [tests.md](tests.md).
+
+### Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| Cosmian KMS | Running on `https://localhost:9998` with mTLS. Use `config.test.toml` to point the provider at it. |
+| SQL Server | Default instance running locally; the EKM feature enabled (`sp_configure 'EKM provider enabled'`). |
+| Deployed DLL | Built, signed, and copied to `C:\Program Files\Cosmian\EKM\cosmian_ekm_sql_server.dll`. |
+| `CosmianEKM` provider registered | `sys.cryptographic_providers` must have a row for `CosmianEKM`. |
+| `config.toml` | The test config (`config.test.toml`) copied to `C:\ProgramData\Cosmian\EKM\config.toml`. |
+| Correct `WIN_LOGIN` | The constant at the top of `tests/integration.rs` must match your Windows login (`DOMAIN\username`). |
+
+### Step 1 - Set your Windows login name
+
+Open `tests/integration.rs` and update the `WIN_LOGIN` constant to match your
+Windows login name (the one you use to connect to SQL Server with `-E`):
+
+```rust
+const WIN_LOGIN: &str = "YOURDOMAIN\\YourLogin";  // e.g. "DESKTOP-ABC\\alice"
+```
+
+You can find your login with:
+
+```powershell
+[System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+```
+
+### Step 2 - Prepare the test environment
+
+Run the preparation script **once per test cycle** from an elevated PowerShell.
+It builds the DLL, signs it, deploys it (stop SQL Server → copy → start), and
+installs `config.test.toml` as the active provider config:
+
+```powershell
+# From the repository root, elevated PowerShell:
+.\scripts\Prepare-Integration-Tests.ps1
+```
+
+Prerequisites that must have been run **at least once** before:
+
+```powershell
+.\scripts\New-EkmCertificate.ps1            # create & trust the self-signed code-signing cert
+.\scripts\Initialize-EkmEnvironment.ps1     # create dirs, set ACLs
+```
+
+### Step 3 - Run the tests
+
+```powershell
+cargo test --test integration -- --test-threads=1
+```
+
+Tests **must** run sequentially (`--test-threads=1`): they share the SQL Server
+credential, key objects, and test databases.
+
+To run a single test:
+
+```powershell
+cargo test --test integration t05_create_asymmetric_key -- --test-threads=1
+```
+
+### Notes
+
+- Tests are numbered (`t00` … `t13`, `t99`) so alphabetical ordering matches
+  execution order.
+- `t99_cleanup` drops all objects created by the suite.  Re-running the suite
+  from `t00` is safe.
+- If a test fails mid-run, re-run from `t04_credential_setup` to restore the
+  credential and keys (or run `t99_cleanup` first to reset state).
+- Log output from the provider DLL is written to
+  `C:\ProgramData\Cosmian\EKM\logs\cosmian_ekm.log.<date>` — tail it to
+  diagnose failures.
+
+---
+
 ## Project structure
 
-```
+```text
 build.rs          # Calls bindgen to generate Rust types from sqlcrypt.h
 Cargo.toml
 src/

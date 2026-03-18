@@ -1,7 +1,10 @@
 {
     "chat.tools.terminal.autoApprove": {
         "cargo build": true,
-        "&": true
+        "&": true,
+        "Test-Path": true,
+        "Get-Command": true,
+        "cargo check": true
     },
     "cSpell.words": [
         "Cosmian"

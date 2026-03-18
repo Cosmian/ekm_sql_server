@@ -522,12 +522,14 @@ dependencies = [
  "cosmian_kms_client",
  "openssl",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

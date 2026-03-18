@@ -1,0 +1,23 @@
+# Cosmian KMS server configuration for integration tests.
+# Start with:
+#   cd C:\Users\bgrieder\projects\kms
+#   cargo run -p cosmian_kms_server -- --config C:\Users\bgrieder\projects\cosmian_ekm_sql_server\kms_test_server.toml
+
+default_username = "admin"
+force_default_username = false
+info = false
+
+[db]
+database_type = "sqlite"
+clear_database = false
+
+[tls]
+tls_cert_file = "C:\\Users\\bgrieder\\projects\\cosmian_ekm_sql_server\\certificates\\server.cert.pem"
+tls_key_file  = "C:\\Users\\bgrieder\\projects\\cosmian_ekm_sql_server\\certificates\\server.key.pem"
+
+# Enable mTLS: clients must present a certificate signed by this CA
+clients_ca_cert_file = "C:\\Users\\bgrieder\\projects\\cosmian_ekm_sql_server\\certificates\\ca.cert.pem"
+
+[http]
+port = 9998
+hostname = "0.0.0.0"

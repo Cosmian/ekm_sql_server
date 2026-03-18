@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
 mod config;
+mod key_store;
 mod kms_client;
 mod session_store;
 use session_store::{SessionCredential, SessionStore};
@@ -62,6 +63,17 @@ fn session_store() -> &'static SessionStore {
     SESSION_STORE.get_or_init(|| {
         let cfg = config::EkmConfig::load();
         SessionStore::new(cfg.max_age_seconds, cfg.stale_collector_period_seconds)
+    })
+}
+
+/// Global key store: maps thumbprint (UUID hex) → key metadata.
+/// Persisted to `%PROGRAMDATA%\Cosmian\EKM\keystore.json`.
+static KEY_STORE: OnceLock<key_store::KeyStore> = OnceLock::new();
+
+fn key_store() -> &'static key_store::KeyStore {
+    KEY_STORE.get_or_init(|| {
+        let base = config::ekm_config_dir();
+        key_store::KeyStore::new(base.join("keystore.json"))
     })
 }
 
@@ -625,6 +637,18 @@ pub extern "C" fn SqlCryptCreateKey(
                 std::ptr::copy_nonoverlapping(thumb_bytes.as_ptr(), thumb.pb, len);
                 thumb.cb = len as ULONG;
             }
+
+            // Persist key name → thumbprint mapping for later GetKeyInfo calls.
+            let thumb_hex = kms_client::thumbprint_to_uuid(&thumb_bytes).unwrap_or_default();
+            key_store().insert(
+                &thumb_hex,
+                key_store::KeyEntry {
+                    key_name: key_name.to_string(),
+                    is_symmetric,
+                    bit_len: alg.bit_len,
+                },
+            );
+
             info!(
                 session_id,
                 key_name = %key_name,
@@ -651,9 +675,47 @@ pub extern "C" fn SqlCryptDropKey(
     p_key_thumb: *const SqlCpKeyThumbprint,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = p_key_thumb;
+    if p_sess.is_null() || p_key_thumb.is_null() {
+        return scp_err_InvalidArgument;
+    }
+
+    let thumb = unsafe { &*p_key_thumb };
+    if thumb.pb.is_null() || (thumb.cb as usize) < size_of::<GUID>() {
+        return scp_err_InvalidArgument;
+    }
+
     info!(session_id, "SqlCryptDropKey called");
-    scp_err_NotSupported
+
+    let username = match session_store().with_session(session_id, |cred| cred.username.clone()) {
+        Some(name) => name,
+        None => {
+            warn!(session_id, "SqlCryptDropKey: session not found");
+            return scp_err_NotFound;
+        }
+    };
+
+    let ekm_config = config::EkmConfig::load();
+    if ekm_config.kms.server_url.is_none() {
+        error!(session_id, "SqlCryptDropKey: kms.server_url not configured");
+        return scp_err_NotSupported;
+    }
+
+    let thumb_bytes = unsafe { std::slice::from_raw_parts(thumb.pb, thumb.cb as usize) };
+
+    match kms_client::destroy_key(&ekm_config.kms, &username, thumb_bytes) {
+        Ok(()) => {
+            // Remove from local keystore.
+            if let Some(uuid) = kms_client::thumbprint_to_uuid(thumb_bytes) {
+                key_store().remove(&uuid);
+            }
+            info!(session_id, "SqlCryptDropKey: key destroyed");
+            scp_err_Success
+        }
+        Err(e) => {
+            error!(session_id, error = %e, "SqlCryptDropKey: destroy failed");
+            scp_err_NotSupported
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -664,8 +726,135 @@ pub extern "C" fn SqlCryptGetNextKeyId(
     let session_id = session_id_of(p_sess);
     let _ = p_key_id;
     info!(session_id, "SqlCryptGetNextKeyId called");
-    // Return NotFound to signal an empty key enumeration (no keys provisioned yet).
+    // Key enumeration is not supported — keys are managed by name/thumbprint.
+    // Return NotFound to signal an empty enumeration.
     scp_err_NotFound
+}
+
+// ---------------------------------------------------------------------------
+// Helper: populate a SqlCpKeyInfo from KMS key metadata
+// ---------------------------------------------------------------------------
+
+/// Look up the algorithm entry whose name/bitlen matches the KMS response.
+fn alg_entry_for_key_info(key_info: &kms_client::KeyInfo) -> Option<&'static AlgEntry> {
+    ALG_TABLE.iter().find(|e| {
+        let type_matches = if key_info.is_symmetric {
+            e.key_type == SqlCpKeyType::scp_kt_Symmetric
+        } else {
+            e.key_type == SqlCpKeyType::scp_kt_Asymmetric
+        };
+        type_matches && e.bit_len == key_info.bit_len
+    })
+}
+
+/// Populate a caller-provided `SqlCpKeyInfo`, following the two-call
+/// buffer-negotiation protocol.
+///
+/// # Safety
+/// `p_key_info` must be a valid, non-null pointer.
+unsafe fn populate_key_info(
+    p_key_info: *mut SqlCpKeyInfo,
+    key_info: &kms_client::KeyInfo,
+    thumb_bytes: &[u8; 16],
+) -> SqlCpError {
+    let info = unsafe { &mut *p_key_info };
+
+    // Encode the key name as UTF-16LE for SqlCpStr.
+    let name_utf16: Vec<u16> = key_info.key_name.encode_utf16().collect();
+    let cb_name_required = (name_utf16.len() * size_of::<u16>()) as ULONG;
+    let cb_thumb_required = size_of::<GUID>() as ULONG;
+
+    // Check both buffers at once (per the Microsoft pattern).
+    let mut insufficient = false;
+
+    if info.name.cb < cb_name_required || info.name.ws.is_null() {
+        info.name.cb = cb_name_required;
+        insufficient = true;
+    }
+    if info.thumb.cb < cb_thumb_required || info.thumb.pb.is_null() {
+        info.thumb.cb = cb_thumb_required;
+        insufficient = true;
+    }
+    if insufficient {
+        return scp_err_InsufficientBuffer;
+    }
+
+    // Copy name
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            name_utf16.as_ptr(),
+            info.name.ws as *mut u16,
+            name_utf16.len(),
+        );
+    }
+    info.name.cb = cb_name_required;
+
+    // Copy thumbprint
+    let len = thumb_bytes.len().min(info.thumb.cb as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(thumb_bytes.as_ptr(), info.thumb.pb, len);
+    }
+    info.thumb.cb = cb_thumb_required;
+
+    // Fill algorithm ID and flags from our table
+    if let Some(alg) = alg_entry_for_key_info(key_info) {
+        info.algId = alg.id;
+    } else {
+        info.algId = 0; // x_scp_AlgIdBad
+    }
+    info.flags = SqlCpKeyFlagsBm::scp_kf_Supported as SqlCpKeyFlags;
+
+    scp_err_Success
+}
+
+/// Common helper: load config, resolve username, get key info by UUID,
+/// then populate `SqlCpKeyInfo`.
+fn do_get_key_info(session_id: u32, uuid: &str, p_key_info: *mut SqlCpKeyInfo) -> SqlCpError {
+    let username = match session_store().with_session(session_id, |cred| cred.username.clone()) {
+        Some(name) => name,
+        None => {
+            warn!(session_id, "GetKeyInfo: session not found");
+            return scp_err_NotFound;
+        }
+    };
+
+    let ekm_config = config::EkmConfig::load();
+    if ekm_config.kms.server_url.is_none() {
+        error!(session_id, "GetKeyInfo: kms.server_url not configured");
+        return scp_err_NotSupported;
+    }
+
+    // Try the local keystore first for the key name.
+    let local_entry = key_store().get(uuid);
+
+    match kms_client::get_key_info_by_id(&ekm_config.kms, &username, uuid) {
+        Ok(mut key_info) => {
+            // Override the key name with the locally-stored PROVIDER_KEY_NAME
+            // if available (the KMS doesn't return it via GetAttributes).
+            if let Some(entry) = &local_entry {
+                key_info.key_name = entry.key_name.clone();
+            }
+
+            let thumb = match kms_client::uuid_str_to_bytes(uuid) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(session_id, error = %e, "GetKeyInfo: bad UUID");
+                    return scp_err_NotFound;
+                }
+            };
+            info!(
+                session_id,
+                uuid,
+                key_name = %key_info.key_name,
+                "GetKeyInfo: resolved key"
+            );
+            unsafe { populate_key_info(p_key_info, &key_info, &thumb) }
+        }
+        Err(e) => {
+            warn!(session_id, error = %e, "GetKeyInfo: KMS lookup failed");
+            scp_err_NotFound
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -675,13 +864,13 @@ pub extern "C" fn SqlCryptGetKeyInfoByKeyId(
     p_key_info: *mut SqlCpKeyInfo,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (key_id, p_key_info);
-    info!(session_id, "SqlCryptGetKeyInfoByKeyId called");
-    // TODO: When implemented, follow the memory-management contract:
-    // If p_key_info is NULL or the embedded SqlCpStr buffers are too small,
-    // populate the `cb` fields with the required byte counts and return
-    // scp_err_InsufficientBuffer.  Never allocate on behalf of the caller.
-    scp_err_NotSupported
+    if p_sess.is_null() || p_key_info.is_null() || key_id == 0 {
+        return scp_err_InvalidArgument;
+    }
+    info!(session_id, key_id, "SqlCryptGetKeyInfoByKeyId called");
+    // We don't assign integer key IDs — keys are identified by
+    // thumbprint (UUID).  Return NotFound.
+    scp_err_NotFound
 }
 
 #[unsafe(no_mangle)]
@@ -691,10 +880,24 @@ pub extern "C" fn SqlCryptGetKeyInfoByThumb(
     p_key_info: *mut SqlCpKeyInfo,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (p_key_thumb, p_key_info);
+    if p_sess.is_null() || p_key_thumb.is_null() || p_key_info.is_null() {
+        return scp_err_InvalidArgument;
+    }
+
+    let thumb = unsafe { &*p_key_thumb };
+    if thumb.pb.is_null() || (thumb.cb as usize) < size_of::<GUID>() {
+        return scp_err_InvalidArgument;
+    }
+
     info!(session_id, "SqlCryptGetKeyInfoByThumb called");
-    // TODO: same InsufficientBuffer contract as GetKeyInfoByKeyId.
-    scp_err_NotSupported
+
+    let thumb_bytes = unsafe { std::slice::from_raw_parts(thumb.pb, thumb.cb.min(16) as usize) };
+    let uuid = match kms_client::thumbprint_to_uuid(thumb_bytes) {
+        Some(u) => u,
+        None => return scp_err_InvalidArgument,
+    };
+
+    do_get_key_info(session_id, &uuid, p_key_info)
 }
 
 #[unsafe(no_mangle)]
@@ -704,48 +907,150 @@ pub extern "C" fn SqlCryptGetKeyInfoByName(
     p_key_info: *mut SqlCpKeyInfo,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (p_key_name, p_key_info);
-    info!(session_id, "SqlCryptGetKeyInfoByName called");
-    // TODO: same InsufficientBuffer contract as GetKeyInfoByKeyId.
-    scp_err_NotSupported
+    if p_sess.is_null() || p_key_name.is_null() || p_key_info.is_null() {
+        return scp_err_InvalidArgument;
+    }
+
+    let key_name = unsafe { sql_cp_str_to_string(&*p_key_name) };
+    info!(session_id, key_name = %key_name, "SqlCryptGetKeyInfoByName called");
+
+    // Look up the key name in the local keystore first.
+    if let Some((uuid, _entry)) = key_store().get_by_name(key_name.trim()) {
+        return do_get_key_info(session_id, &uuid, p_key_info);
+    }
+
+    // Fall back: the name might itself be a UUID (e.g. for OPEN_EXISTING).
+    let uuid = key_name.trim().to_string();
+    do_get_key_info(session_id, &uuid, p_key_info)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SqlCryptExportKey(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
-    key_encryptor_thumb: *const SqlCpKeyThumbprint,
+    _key_encryptor_thumb: *const SqlCpKeyThumbprint,
     blob_type: SqlCpKeyBlobType,
     p_key_blob: *mut SqlCpKeyBlob,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (p_key_thumb, key_encryptor_thumb, blob_type, p_key_blob);
-    info!(session_id, "SqlCryptExportKey called");
-    // TODO: When implemented, if p_key_blob is NULL or p_key_blob.cb is too
-    // small, set p_key_blob.cb to the required size and return
-    // scp_err_InsufficientBuffer.  Never allocate memory on behalf of the caller.
-    scp_err_NotSupported
+    if p_sess.is_null() || p_key_thumb.is_null() || p_key_blob.is_null() {
+        return scp_err_InvalidArgument;
+    }
+
+    // Only public-key export is supported (per the EKM spec).
+    if blob_type != SqlCpKeyBlobType::scp_kb_PublicKeyBlob {
+        info!(
+            session_id,
+            ?blob_type,
+            "SqlCryptExportKey: unsupported blob type"
+        );
+        return scp_err_NotSupported;
+    }
+
+    let thumb = unsafe { &*p_key_thumb };
+    if thumb.pb.is_null() || (thumb.cb as usize) < size_of::<GUID>() {
+        return scp_err_InvalidArgument;
+    }
+
+    info!(session_id, "SqlCryptExportKey called (PublicKeyBlob)");
+
+    let username = match session_store().with_session(session_id, |cred| cred.username.clone()) {
+        Some(name) => name,
+        None => {
+            warn!(session_id, "SqlCryptExportKey: session not found");
+            return scp_err_NotFound;
+        }
+    };
+
+    let ekm_config = config::EkmConfig::load();
+    if ekm_config.kms.server_url.is_none() {
+        error!(
+            session_id,
+            "SqlCryptExportKey: kms.server_url not configured"
+        );
+        return scp_err_NotSupported;
+    }
+
+    let thumb_bytes = unsafe { std::slice::from_raw_parts(thumb.pb, thumb.cb.min(16) as usize) };
+
+    match kms_client::export_public_key(&ekm_config.kms, &username, thumb_bytes) {
+        Ok(key_blob_bytes) => {
+            let blob = unsafe { &mut *p_key_blob };
+            let required = key_blob_bytes.len() as ULONG;
+
+            // Buffer-size negotiation
+            if blob.pb.is_null() || blob.cb < required {
+                blob.cb = required;
+                return scp_err_InsufficientBuffer;
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    key_blob_bytes.as_ptr(),
+                    blob.pb,
+                    key_blob_bytes.len(),
+                );
+            }
+            blob.cb = required;
+            info!(
+                session_id,
+                blob_len = required,
+                "SqlCryptExportKey: public key exported"
+            );
+            scp_err_Success
+        }
+        Err(e) => {
+            error!(session_id, error = %e, "SqlCryptExportKey: export failed");
+            scp_err_NotSupported
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SqlCryptImportKey(
     p_sess: *const SqlCpSession,
-    p_key_name: *const SqlCpStr,
-    key_decryptor_thumb: *const SqlCpKeyThumbprint,
-    blob_type: SqlCpKeyBlobType,
-    key_flags: SqlCpKeyFlags,
-    p_key_blob: *const SqlCpKeyBlob,
+    _p_key_name: *const SqlCpStr,
+    _key_decryptor_thumb: *const SqlCpKeyThumbprint,
+    _blob_type: SqlCpKeyBlobType,
+    _key_flags: SqlCpKeyFlags,
+    _p_key_blob: *const SqlCpKeyBlob,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (
-        p_key_name,
-        key_decryptor_thumb,
-        blob_type,
-        key_flags,
-        p_key_blob,
-    );
     info!(session_id, "SqlCryptImportKey called");
+    // Per Microsoft EKM spec: "This method is not currently used and it
+    // should return an error."
     scp_err_NotSupported
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract IV from SqlCpEncryptionParam array
+// ---------------------------------------------------------------------------
+
+/// Extract the IV (Initialization Vector) from the encryption parameters.
+///
+/// # Safety
+/// `p_params` must point to an array of `count` valid `SqlCpEncryptionParam`.
+unsafe fn extract_iv(p_params: *const SqlCpEncryptionParam, count: ULONG) -> Option<Vec<u8>> {
+    if p_params.is_null() || count == 0 {
+        return None;
+    }
+    let params = unsafe { std::slice::from_raw_parts(p_params, count as usize) };
+    for p in params {
+        if p.type_ == SqlCpEncParamType::scp_ep_IV && !p.pb.is_null() && p.cb > 0 {
+            let iv = unsafe { std::slice::from_raw_parts(p.pb, p.cb as usize) };
+            return Some(iv.to_vec());
+        }
+    }
+    None
+}
+
+/// Determine whether a key thumbprint identifies a symmetric key by looking
+/// up the algorithm in the KMS.  Falls back to `true` (AES) if lookup fails.
+fn is_key_symmetric(ekm_config: &config::EkmConfig, username: &str, thumb_bytes: &[u8]) -> bool {
+    match kms_client::get_key_info_by_thumb(&ekm_config.kms, username, thumb_bytes) {
+        Ok(info) => info.is_symmetric,
+        Err(_) => true, // default assumption
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -756,44 +1061,199 @@ pub extern "C" fn SqlCryptImportKey(
 pub extern "C" fn SqlCryptEncrypt(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
-    f_final: BOOLEAN,
+    _f_final: BOOLEAN,
     p_encrypt_params: *const SqlCpEncryptionParam,
     c_encrypt_params: ULONG,
     p_data_plain_text: *const SqlCpData,
     p_data_ciphertext: *mut SqlCpData,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (
-        p_key_thumb,
-        f_final,
-        p_encrypt_params,
-        c_encrypt_params,
-        p_data_plain_text,
-        p_data_ciphertext,
+    if p_sess.is_null()
+        || p_key_thumb.is_null()
+        || p_data_plain_text.is_null()
+        || p_data_ciphertext.is_null()
+    {
+        return scp_err_InvalidArgument;
+    }
+
+    let thumb = unsafe { &*p_key_thumb };
+    if thumb.pb.is_null() || (thumb.cb as usize) < size_of::<GUID>() {
+        return scp_err_InvalidArgument;
+    }
+
+    let plaintext_data = unsafe { &*p_data_plain_text };
+    if plaintext_data.pb.is_null() || plaintext_data.cb == 0 {
+        return scp_err_InvalidArgument;
+    }
+
+    info!(
+        session_id,
+        plaintext_len = plaintext_data.cb,
+        "SqlCryptEncrypt called"
     );
-    info!(session_id, "SqlCryptEncrypt called");
-    scp_err_NotSupported
+
+    let username = match session_store().with_session(session_id, |cred| cred.username.clone()) {
+        Some(name) => name,
+        None => {
+            warn!(session_id, "SqlCryptEncrypt: session not found");
+            return scp_err_NotFound;
+        }
+    };
+
+    let ekm_config = config::EkmConfig::load();
+    if ekm_config.kms.server_url.is_none() {
+        error!(session_id, "SqlCryptEncrypt: kms.server_url not configured");
+        return scp_err_NotSupported;
+    }
+
+    let thumb_bytes = unsafe { std::slice::from_raw_parts(thumb.pb, thumb.cb.min(16) as usize) };
+    let plaintext =
+        unsafe { std::slice::from_raw_parts(plaintext_data.pb, plaintext_data.cb as usize) };
+    let iv = unsafe { extract_iv(p_encrypt_params, c_encrypt_params) };
+    let is_symmetric = is_key_symmetric(&ekm_config, &username, thumb_bytes);
+
+    match kms_client::encrypt(
+        &ekm_config.kms,
+        &username,
+        thumb_bytes,
+        plaintext,
+        iv.as_deref(),
+        is_symmetric,
+    ) {
+        Ok((ciphertext, returned_iv)) => {
+            // For symmetric encryption, we prepend the IV to the ciphertext
+            // so that decrypt can recover it.
+            let output = if is_symmetric {
+                let mut out = returned_iv.unwrap_or_default();
+                out.extend_from_slice(&ciphertext);
+                out
+            } else {
+                ciphertext
+            };
+
+            let ct = unsafe { &mut *p_data_ciphertext };
+            let required = output.len() as ULONG;
+
+            if ct.pb.is_null() || ct.cb < required {
+                ct.cb = required;
+                return scp_err_InsufficientBuffer;
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(output.as_ptr(), ct.pb, output.len());
+            }
+            ct.cb = required;
+
+            info!(
+                session_id,
+                ciphertext_len = required,
+                "SqlCryptEncrypt: encryption successful"
+            );
+            scp_err_Success
+        }
+        Err(e) => {
+            error!(session_id, error = %e, "SqlCryptEncrypt: encryption failed");
+            scp_err_NotSupported
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SqlCryptDecrypt(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
-    f_final: BOOLEAN,
+    _f_final: BOOLEAN,
     p_encrypt_params: *const SqlCpEncryptionParam,
     c_encrypt_params: ULONG,
     p_data_ciphertext: *const SqlCpData,
     p_data_plain_text: *mut SqlCpData,
 ) -> SqlCpError {
     let session_id = session_id_of(p_sess);
-    let _ = (
-        p_key_thumb,
-        f_final,
-        p_encrypt_params,
-        c_encrypt_params,
-        p_data_ciphertext,
-        p_data_plain_text,
+    if p_sess.is_null()
+        || p_key_thumb.is_null()
+        || p_data_ciphertext.is_null()
+        || p_data_plain_text.is_null()
+    {
+        return scp_err_InvalidArgument;
+    }
+
+    let thumb = unsafe { &*p_key_thumb };
+    if thumb.pb.is_null() || (thumb.cb as usize) < size_of::<GUID>() {
+        return scp_err_InvalidArgument;
+    }
+
+    let ct_data = unsafe { &*p_data_ciphertext };
+    if ct_data.pb.is_null() || ct_data.cb == 0 {
+        return scp_err_InvalidArgument;
+    }
+
+    info!(
+        session_id,
+        ciphertext_len = ct_data.cb,
+        "SqlCryptDecrypt called"
     );
-    info!(session_id, "SqlCryptDecrypt called");
-    scp_err_NotSupported
+
+    let username = match session_store().with_session(session_id, |cred| cred.username.clone()) {
+        Some(name) => name,
+        None => {
+            warn!(session_id, "SqlCryptDecrypt: session not found");
+            return scp_err_NotFound;
+        }
+    };
+
+    let ekm_config = config::EkmConfig::load();
+    if ekm_config.kms.server_url.is_none() {
+        error!(session_id, "SqlCryptDecrypt: kms.server_url not configured");
+        return scp_err_NotSupported;
+    }
+
+    let thumb_bytes = unsafe { std::slice::from_raw_parts(thumb.pb, thumb.cb.min(16) as usize) };
+    let raw_ciphertext = unsafe { std::slice::from_raw_parts(ct_data.pb, ct_data.cb as usize) };
+    let caller_iv = unsafe { extract_iv(p_encrypt_params, c_encrypt_params) };
+    let is_symmetric = is_key_symmetric(&ekm_config, &username, thumb_bytes);
+
+    // For symmetric encryption, the IV may be prepended to the ciphertext
+    // (as done by our SqlCryptEncrypt).  If no IV was explicitly provided
+    // and the key is symmetric, split the first 16 bytes as IV.
+    let (iv, ciphertext) = if is_symmetric && caller_iv.is_none() && raw_ciphertext.len() > 16 {
+        let (iv_part, ct_part) = raw_ciphertext.split_at(16);
+        (Some(iv_part.to_vec()), ct_part)
+    } else {
+        (caller_iv, raw_ciphertext)
+    };
+
+    match kms_client::decrypt(
+        &ekm_config.kms,
+        &username,
+        thumb_bytes,
+        ciphertext,
+        iv.as_deref(),
+        is_symmetric,
+    ) {
+        Ok(plaintext) => {
+            let pt = unsafe { &mut *p_data_plain_text };
+            let required = plaintext.len() as ULONG;
+
+            if pt.pb.is_null() || pt.cb < required {
+                pt.cb = required;
+                return scp_err_InsufficientBuffer;
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(plaintext.as_ptr(), pt.pb, plaintext.len());
+            }
+            pt.cb = required;
+
+            info!(
+                session_id,
+                plaintext_len = required,
+                "SqlCryptDecrypt: decryption successful"
+            );
+            scp_err_Success
+        }
+        Err(e) => {
+            error!(session_id, error = %e, "SqlCryptDecrypt: decryption failed");
+            scp_err_NotSupported
+        }
+    }
 }

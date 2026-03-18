@@ -108,22 +108,20 @@ pub struct ClientCertEntry {
     pub client_key: String,
 }
 
+/// Return the EKM configuration directory: `%PROGRAMDATA%\Cosmian\EKM`.
+pub fn ekm_config_dir() -> std::path::PathBuf {
+    std::env::var("PROGRAMDATA")
+        .map(|p| std::path::PathBuf::from(p).join("Cosmian").join("EKM"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(r"C:\ProgramData\Cosmian\EKM"))
+}
+
 impl EkmConfig {
     /// Load configuration from `%PROGRAMDATA%\Cosmian\EKM\config.toml`.
     ///
     /// * If the file does not exist, returns defaults silently (logged at INFO).
     /// * If the file exists but cannot be parsed, returns defaults and logs a WARNING.
     pub fn load() -> Self {
-        let config_path = std::env::var("PROGRAMDATA")
-            .map(|p| {
-                std::path::PathBuf::from(p)
-                    .join("Cosmian")
-                    .join("EKM")
-                    .join("config.toml")
-            })
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(r"C:\ProgramData\Cosmian\EKM\config.toml")
-            });
+        let config_path = ekm_config_dir().join("config.toml");
 
         match std::fs::read_to_string(&config_path) {
             Ok(contents) => match toml::from_str::<EkmConfig>(&contents) {

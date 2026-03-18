@@ -1,0 +1,16 @@
+# Cosmian EKM Provider — Test Configuration
+# This file should be placed at:
+#   %PROGRAMDATA%\Cosmian\EKM\config.toml
+# (typically C:\ProgramData\Cosmian\EKM\config.toml)
+
+max_age_seconds = 1800
+stale_collector_period_seconds = 120
+
+[kms]
+server_url = "https://localhost:9998"
+accept_invalid_certs = true
+
+[[kms.certificates]]
+username    = "admin"
+client_cert = "C:\\Users\\bgrieder\\projects\\cosmian_ekm_sql_server\\certificates\\admin.cert.pem"
+client_key  = "C:\\Users\\bgrieder\\projects\\cosmian_ekm_sql_server\\certificates\\admin.key.pem"
