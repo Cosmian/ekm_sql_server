@@ -281,22 +281,48 @@ fn init_logging() {
 // Provider initialization
 // ---------------------------------------------------------------------------
 
+/// Initialises the provider when SQL Server first loads the DLL.
+///
+/// Called once per DLL load, before any other `SqlCrypt*` function.
+/// Starts the rolling log-file appender; all subsequent entry points
+/// emit structured log records to that file.
+///
+/// Returns `scp_err_Success` unconditionally.
+///
+/// # Safety
+///
+/// Must be called exactly once by SQL Server before any other `SqlCrypt*`
+/// entry point. Calling it more than once or from a context that does not
+/// hold an exclusive load reference to the DLL is undefined behaviour.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptInitializeProvider() -> SqlCpError {
+pub unsafe extern "C" fn SqlCryptInitializeProvider() -> SqlCpError {
     init_logging();
     info!("SqlCryptInitializeProvider called");
     scp_err_Success
 }
 
+/// Frees all resources held by the provider when SQL Server unloads the DLL.
+///
+/// Called once, symmetrically with [`SqlCryptInitializeProvider`].
+/// Flushes and shuts down the background logging thread so that no log
+/// records are lost when SQL Server unloads the DLL.
+///
+/// Returns `scp_err_Success` unconditionally.
+///
+/// # Safety
+///
+/// Must be called exactly once, after all sessions are closed and no other
+/// `SqlCrypt*` entry point is in flight. Calling it out of sequence with
+/// [`SqlCryptInitializeProvider`] is undefined behaviour.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptFreeProvider() -> SqlCpError {
+pub unsafe extern "C" fn SqlCryptFreeProvider() -> SqlCpError {
     debug!("SqlCryptFreeProvider called");
     // Drop the WorkerGuard so the background logging thread flushes and exits
     // cleanly before the DLL is unloaded.
-    if let Some(cell) = LOG_GUARD.get() {
-        if let Ok(mut guard) = cell.lock() {
-            drop(guard.take());
-        }
+    if let Some(cell) = LOG_GUARD.get()
+        && let Ok(mut guard) = cell.lock()
+    {
+        drop(guard.take());
     }
     info!("Cosmian EKM provider freed and logging shut down");
     scp_err_Success
@@ -306,8 +332,21 @@ pub extern "C" fn SqlCryptFreeProvider() -> SqlCpError {
 // Session management
 // ---------------------------------------------------------------------------
 
+/// Opens a new session for the given credential.
+///
+/// SQL Server calls this once per connection (or query batch) that uses EKM
+/// keys.  The credential passed in `p_auth` must correspond to a
+/// `[[kms.certificates]]` entry in `config.toml`.
+///
+/// On success, writes a monotonically-increasing session handle into
+/// `*p_sess` and stores the decoded credential in the session store.
+///
+/// # Safety
+///
+/// `p_auth` must be a valid, non-null pointer to a `SqlCpCredential`.
+/// `p_sess` must be a valid, non-null, writable pointer to a `SqlCpSession`.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptOpenSession(
+pub unsafe extern "C" fn SqlCryptOpenSession(
     p_auth: *const SqlCpCredential,
     p_sess: *mut SqlCpSession,
 ) -> SqlCpError {
@@ -345,8 +384,22 @@ pub extern "C" fn SqlCryptOpenSession(
     scp_err_Success
 }
 
+/// Closes an existing session.
+///
+/// Removes the session from the session store.
+/// `f_abort` indicates whether the session is being aborted
+/// (e.g. due to an error), but the provider treats abort and
+/// normal close identically.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a `SqlCpSession` that was
+/// previously opened with [`SqlCryptOpenSession`].
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptCloseSession(p_sess: *mut SqlCpSession, f_abort: BOOLEAN) -> SqlCpError {
+pub unsafe extern "C" fn SqlCryptCloseSession(
+    p_sess: *mut SqlCpSession,
+    f_abort: BOOLEAN,
+) -> SqlCpError {
     debug!("SqlCryptCloseSession called");
     if p_sess.is_null() {
         return scp_err_InvalidArgument;
@@ -365,8 +418,28 @@ pub extern "C" fn SqlCryptCloseSession(p_sess: *mut SqlCpSession, f_abort: BOOLE
 // Provider info
 // ---------------------------------------------------------------------------
 
+/// Returns capability and identity information about this EKM provider.
+///
+/// SQL Server calls this during `CREATE CRYPTOGRAPHIC PROVIDER` to
+/// discover the provider name, GUID, supported authentication type,
+/// key support flags, and thumbprint length.
+///
+/// Uses the standard two-call buffer-negotiation protocol:
+///
+/// - Call 1: `p_provider_info->name.ws` is `NULL`. The provider sets
+///   `name.cb` to the required byte count and returns
+///   `scp_err_InsufficientBuffer`.
+/// - Call 2: `p_provider_info->name.ws` points to an allocated buffer.
+///   The provider fills all fields and copies the provider name string.
+///
+/// # Safety
+///
+/// `p_provider_info` must be a valid, non-null pointer to a
+/// `SqlCpProviderInfo` struct allocated by SQL Server.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetProviderInfo(p_provider_info: *mut SqlCpProviderInfo) -> SqlCpError {
+pub unsafe extern "C" fn SqlCryptGetProviderInfo(
+    p_provider_info: *mut SqlCpProviderInfo,
+) -> SqlCpError {
     debug!("SqlCryptGetProviderInfo called");
     if p_provider_info.is_null() {
         return scp_err_InvalidArgument;
@@ -438,7 +511,7 @@ pub extern "C" fn SqlCryptGetProviderInfo(p_provider_info: *mut SqlCpProviderInf
         if cb_name_required > 0 {
             std::ptr::copy_nonoverlapping(
                 PROVIDER_NAME_UTF16.as_ptr(),
-                caller_name_ws as *mut u16,
+                caller_name_ws,
                 PROVIDER_NAME_CHARS,
             );
         }
@@ -465,8 +538,21 @@ pub extern "C" fn SqlCryptGetProviderInfo(p_provider_info: *mut SqlCpProviderInf
 // Provider algorithms
 // ---------------------------------------------------------------------------
 
+/// Enumerates algorithm IDs supported by this provider.
+///
+/// SQL Server calls this repeatedly, starting with `*p_alg_id = 0`
+/// (`x_scp_AlgIdBad`).  On each call the provider must advance
+/// `*p_alg_id` to the next algorithm ID strictly greater than the
+/// current value, then return `scp_err_Success`.
+/// When no more algorithms remain, the provider returns
+/// `scp_err_NotFound` to signal end-of-enumeration.
+///
+/// # Safety
+///
+/// `p_alg_id` must be a valid, non-null, readable and writable pointer
+/// to a `SqlCpAlgId`.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetNextAlgorithmId(p_alg_id: *mut SqlCpAlgId) -> SqlCpError {
+pub unsafe extern "C" fn SqlCryptGetNextAlgorithmId(p_alg_id: *mut SqlCpAlgId) -> SqlCpError {
     if p_alg_id.is_null() {
         return scp_err_InvalidArgument;
     }
@@ -493,8 +579,24 @@ pub extern "C" fn SqlCryptGetNextAlgorithmId(p_alg_id: *mut SqlCpAlgId) -> SqlCp
     }
 }
 
+/// Returns detailed information about a specific algorithm.
+///
+/// SQL Server calls this (after [`SqlCryptGetNextAlgorithmId`]) for each
+/// algorithm ID, passing `alg_id` and a caller-allocated
+/// `SqlCpAlgorithmInfo` struct.
+///
+/// Uses the same two-call buffer-negotiation protocol as
+/// [`SqlCryptGetProviderInfo`]: on the first call
+/// `p_algorithm_info->algTag.ws` is `NULL`; the provider sets
+/// `algTag.cb` and returns `scp_err_InsufficientBuffer`; on the second
+/// call it fills the struct and copies the tag string.
+///
+/// # Safety
+///
+/// `p_algorithm_info` must be a valid, non-null pointer to a
+/// `SqlCpAlgorithmInfo` struct allocated by SQL Server.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetAlgorithmInfo(
+pub unsafe extern "C" fn SqlCryptGetAlgorithmInfo(
     alg_id: SqlCpAlgId,
     p_algorithm_info: *mut SqlCpAlgorithmInfo,
 ) -> SqlCpError {
@@ -507,7 +609,7 @@ pub extern "C" fn SqlCryptGetAlgorithmInfo(
     };
     unsafe {
         let info = &mut *p_algorithm_info;
-        let cb_tag_required = (entry.tag.len() * size_of::<u16>()) as ULONG;
+        let cb_tag_required = std::mem::size_of_val(entry.tag) as ULONG;
 
         // Two-call buffer-negotiation for algTag.ws, matching the Microsoft
         // USBCryptoProvider pattern exactly:
@@ -551,11 +653,7 @@ pub extern "C" fn SqlCryptGetAlgorithmInfo(
         let info = &mut *p_algorithm_info;
         info.algTag.ws = caller_tag_ws;
         if cb_tag_required > 0 {
-            std::ptr::copy_nonoverlapping(
-                entry.tag.as_ptr(),
-                caller_tag_ws as *mut u16,
-                entry.tag.len(),
-            );
+            std::ptr::copy_nonoverlapping(entry.tag.as_ptr(), caller_tag_ws, entry.tag.len());
         }
         info!(
             alg_id,
@@ -573,8 +671,25 @@ pub extern "C" fn SqlCryptGetAlgorithmInfo(
 // Key management
 // ---------------------------------------------------------------------------
 
+/// Creates a new cryptographic key on the Cosmian KMS.
+///
+/// Called by `CREATE ASYMMETRIC KEY … FROM PROVIDER` or
+/// `CREATE SYMMETRIC KEY … FROM PROVIDER`.  The provider generates the
+/// key material on the KMS and returns a 16-byte thumbprint that SQL
+/// Server stores as the key's persistent identifier.
+///
+/// `p_key_name` is the `PROVIDER_KEY_NAME` supplied in the T-SQL
+/// statement; it is passed to the KMS as a tag so the key can be
+/// looked up by name later.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null session handle.
+/// `p_key_name` must be a valid, non-null pointer to a `SqlCpStr`.
+/// `p_key_thumb` must be a valid, non-null, writable pointer to a
+/// `SqlCpKeyThumbprint` with `cb` set to the available buffer size.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptCreateKey(
+pub unsafe extern "C" fn SqlCryptCreateKey(
     p_sess: *const SqlCpSession,
     p_key_name: *const SqlCpStr,
     algid: SqlCpAlgId,
@@ -669,8 +784,23 @@ pub extern "C" fn SqlCryptCreateKey(
     }
 }
 
+/// Destroys a key on the Cosmian KMS.
+///
+/// Called by `DROP ASYMMETRIC KEY` or `DROP SYMMETRIC KEY` when the key
+/// was created `FROM PROVIDER`.  Revokes and then destroys the key on the
+/// KMS and removes the local keystore entry.
+///
+/// If the KMS revocation fails (e.g. the key was already revoked), the
+/// error is silently ignored and destruction proceeds.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null session handle.
+/// `p_key_thumb` must be a valid, non-null pointer to a
+/// `SqlCpKeyThumbprint` with `cb >= 16` and `pb` pointing to 16 valid
+/// thumbprint bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptDropKey(
+pub unsafe extern "C" fn SqlCryptDropKey(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
 ) -> SqlCpError {
@@ -718,8 +848,20 @@ pub extern "C" fn SqlCryptDropKey(
     }
 }
 
+/// Enumerates keys managed by this provider.
+///
+/// SQL Server calls this to discover which keys are registered with the
+/// provider (e.g. for `sys.dm_cryptographic_provider_keys`).
+/// This provider does not support key enumeration — keys are addressed
+/// exclusively by name or thumbprint — so this function always returns
+/// `scp_err_NotFound` to signal an empty enumeration.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null session handle.
+/// `p_key_id` may be null; it is not read or written.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetNextKeyId(
+pub unsafe extern "C" fn SqlCryptGetNextKeyId(
     p_sess: *const SqlCpSession,
     p_key_id: *mut SqlCpKeyId,
 ) -> SqlCpError {
@@ -781,11 +923,7 @@ unsafe fn populate_key_info(
 
     // Copy name
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            name_utf16.as_ptr(),
-            info.name.ws as *mut u16,
-            name_utf16.len(),
-        );
+        std::ptr::copy_nonoverlapping(name_utf16.as_ptr(), info.name.ws, name_utf16.len());
     }
     info.name.cb = cb_name_required;
 
@@ -857,8 +995,18 @@ fn do_get_key_info(session_id: u32, uuid: &str, p_key_info: *mut SqlCpKeyInfo) -
     }
 }
 
+/// Returns information about a key identified by its integer key ID.
+///
+/// This provider does not assign integer key IDs; keys are identified by
+/// thumbprint (UUID). This function always returns `scp_err_NotFound`.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_info` must be a valid, non-null pointer to a [`SqlCpKeyInfo`]
+/// that the caller has allocated.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetKeyInfoByKeyId(
+pub unsafe extern "C" fn SqlCryptGetKeyInfoByKeyId(
     p_sess: *const SqlCpSession,
     key_id: SqlCpKeyId,
     p_key_info: *mut SqlCpKeyInfo,
@@ -873,8 +1021,21 @@ pub extern "C" fn SqlCryptGetKeyInfoByKeyId(
     scp_err_NotFound
 }
 
+/// Returns information about a key identified by its 16-byte thumbprint.
+///
+/// The thumbprint is the first 16 bytes of the GUID assigned to the key
+/// by the KMS. SQL Server uses this function to map a stored thumbprint
+/// back to current key metadata.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_thumb` must be a valid, non-null pointer to a
+/// [`SqlCpKeyThumbprint`] whose `pb` field points to at least `cb` bytes.
+/// `p_key_info` must be a valid, non-null pointer to a [`SqlCpKeyInfo`]
+/// that the caller has allocated.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetKeyInfoByThumb(
+pub unsafe extern "C" fn SqlCryptGetKeyInfoByThumb(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
     p_key_info: *mut SqlCpKeyInfo,
@@ -900,8 +1061,21 @@ pub extern "C" fn SqlCryptGetKeyInfoByThumb(
     do_get_key_info(session_id, &uuid, p_key_info)
 }
 
+/// Returns information about a key identified by its name string.
+///
+/// The name is first looked up in the local key store; if not found there,
+/// it is treated as a raw UUID and forwarded to the KMS. SQL Server passes
+/// the logical key name as supplied to `CREATE ASYMMETRIC KEY … FROM PROVIDER`.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_name` must be a valid, non-null pointer to a [`SqlCpStr`]
+/// representing a NUL-terminated UTF-16 string.
+/// `p_key_info` must be a valid, non-null pointer to a [`SqlCpKeyInfo`]
+/// that the caller has allocated.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptGetKeyInfoByName(
+pub unsafe extern "C" fn SqlCryptGetKeyInfoByName(
     p_sess: *const SqlCpSession,
     p_key_name: *const SqlCpStr,
     p_key_info: *mut SqlCpKeyInfo,
@@ -924,8 +1098,26 @@ pub extern "C" fn SqlCryptGetKeyInfoByName(
     do_get_key_info(session_id, &uuid, p_key_info)
 }
 
+/// Exports a key in the requested blob format.
+///
+/// Only public-key export (`scp_kb_PublicKeyBlob`) is supported.
+/// Exporting a symmetric key or a private key returns `scp_err_NotSupported`.
+/// SQL Server uses the public key blob for column-master-key operations.
+///
+/// Returns `scp_err_InsufficientBuffer` when `p_key_blob->pb` is null or
+/// too small; in that case `p_key_blob->cb` is set to the required size so
+/// the caller can retry with an adequate buffer.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_thumb` must be a valid, non-null pointer to a
+/// [`SqlCpKeyThumbprint`] whose `pb` field points to at least `cb` bytes.
+/// `p_key_blob` must be a valid, non-null pointer to a [`SqlCpKeyBlob`];
+/// when `pb` is non-null it must point to a writable buffer of at least
+/// `cb` bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptExportKey(
+pub unsafe extern "C" fn SqlCryptExportKey(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
     _key_encryptor_thumb: *const SqlCpKeyThumbprint,
@@ -1006,8 +1198,18 @@ pub extern "C" fn SqlCryptExportKey(
     }
 }
 
+/// Imports a key from an external blob.
+///
+/// Per the Microsoft EKM specification this function is not currently used
+/// by SQL Server and must return `scp_err_NotSupported`.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// All remaining pointer parameters are unused but must be either null
+/// or valid pointers if passed by the caller.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptImportKey(
+pub unsafe extern "C" fn SqlCryptImportKey(
     p_sess: *const SqlCpSession,
     _p_key_name: *const SqlCpStr,
     _key_decryptor_thumb: *const SqlCpKeyThumbprint,
@@ -1057,8 +1259,29 @@ fn is_key_symmetric(ekm_config: &config::EkmConfig, username: &str, thumb_bytes:
 // Encryption / Decryption
 // ---------------------------------------------------------------------------
 
+/// Encrypts plaintext using the key identified by `p_key_thumb`.
+///
+/// For symmetric keys the KMS-generated IV is prepended to the ciphertext
+/// so that [`SqlCryptDecrypt`] can recover it. If the caller supplies an
+/// explicit IV via `p_encrypt_params` it is forwarded to the KMS instead.
+///
+/// Returns `scp_err_InsufficientBuffer` when `p_data_ciphertext->pb` is
+/// null or too small; in that case `->cb` is updated to the required size.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_thumb` must be a valid, non-null pointer to a
+/// [`SqlCpKeyThumbprint`] whose `pb` field points to at least `cb` bytes.
+/// `p_data_plain_text` must be a valid, non-null pointer to a [`SqlCpData`]
+/// whose `pb` field points to `cb` readable bytes.
+/// `p_data_ciphertext` must be a valid, non-null pointer to a [`SqlCpData`];
+/// when `pb` is non-null it must point to a writable buffer of at least
+/// `cb` bytes.
+/// When non-null, `p_encrypt_params` must point to an array of
+/// `c_encrypt_params` valid [`SqlCpEncryptionParam`] structures.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptEncrypt(
+pub unsafe extern "C" fn SqlCryptEncrypt(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
     _f_final: BOOLEAN,
@@ -1158,8 +1381,29 @@ pub extern "C" fn SqlCryptEncrypt(
     }
 }
 
+/// Decrypts ciphertext using the key identified by `p_key_thumb`.
+///
+/// For symmetric keys the first 16 bytes of `p_data_ciphertext` are treated
+/// as the IV unless the caller supplies one explicitly via `p_encrypt_params`.
+/// For asymmetric keys no IV is used.
+///
+/// Returns `scp_err_InsufficientBuffer` when `p_data_plain_text->pb` is
+/// null or too small; in that case `->cb` is updated to the required size.
+///
+/// # Safety
+///
+/// `p_sess` must be a valid, non-null pointer to a [`SqlCpSession`].
+/// `p_key_thumb` must be a valid, non-null pointer to a
+/// [`SqlCpKeyThumbprint`] whose `pb` field points to at least `cb` bytes.
+/// `p_data_ciphertext` must be a valid, non-null pointer to a [`SqlCpData`]
+/// whose `pb` field points to `cb` readable bytes.
+/// `p_data_plain_text` must be a valid, non-null pointer to a [`SqlCpData`];
+/// when `pb` is non-null it must point to a writable buffer of at least
+/// `cb` bytes.
+/// When non-null, `p_encrypt_params` must point to an array of
+/// `c_encrypt_params` valid [`SqlCpEncryptionParam`] structures.
 #[unsafe(no_mangle)]
-pub extern "C" fn SqlCryptDecrypt(
+pub unsafe extern "C" fn SqlCryptDecrypt(
     p_sess: *const SqlCpSession,
     p_key_thumb: *const SqlCpKeyThumbprint,
     _f_final: BOOLEAN,

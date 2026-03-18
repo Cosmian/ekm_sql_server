@@ -17,6 +17,13 @@
 //! `SessionStore` is `Send + Sync` and can therefore live in a `OnceLock<…>`
 //! static without an outer `Mutex`.
 
+// The SessionStore impl. is a bit "over the top": we never manipulate the password, nor call
+// the `is_valid()` and `len()` methods, although they are common in session-store implementations
+// and may be useful for future features or testing.
+// Also, the TTL logic is a bit more complex than a simple `HashMap`
+// but is necessary to meet the requirement of automatic stale-session eviction.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -206,10 +213,10 @@ impl Drop for SessionStore {
         cvar.notify_all();
 
         // Join the thread so it has flushed any in-progress log records.
-        if let Ok(mut guard) = self.collector_thread.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut guard) = self.collector_thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
         }
         debug!("SessionStore dropped");
     }

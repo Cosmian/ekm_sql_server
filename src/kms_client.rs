@@ -55,8 +55,6 @@ pub enum KmsError {
     DecryptError(String),
     /// KMIP Export failed.
     ExportError(String),
-    /// Key not found on the KMS.
-    KeyNotFound(String),
 }
 
 impl std::fmt::Display for KmsError {
@@ -81,7 +79,6 @@ impl std::fmt::Display for KmsError {
             Self::EncryptError(e) => write!(f, "encryption failed on KMS: {e}"),
             Self::DecryptError(e) => write!(f, "decryption failed on KMS: {e}"),
             Self::ExportError(e) => write!(f, "key export failed on KMS: {e}"),
-            Self::KeyNotFound(e) => write!(f, "key not found on KMS: {e}"),
         }
     }
 }
@@ -95,8 +92,8 @@ impl std::error::Error for KmsError {}
 /// Validates that the client certificate's Subject CN or Subject Alternative
 /// Names contain the expected `username` (case-insensitive comparison).
 fn validate_cert_identity(cert_path: &str, expected_username: &str) -> Result<(), KmsError> {
-    use x509_cert::der::DecodePem;
     use x509_cert::Certificate;
+    use x509_cert::der::DecodePem;
 
     let pem_data = std::fs::read_to_string(cert_path)
         .map_err(|e| KmsError::CertReadError(format!("{cert_path}: {e}")))?;
@@ -111,11 +108,11 @@ fn validate_cert_identity(cert_path: &str, expected_username: &str) -> Result<()
             if atv.oid.to_string() == "2.5.4.3" {
                 // DER value octets for UTF8String / PrintableString are the
                 // raw string bytes — safe to interpret as UTF-8.
-                if let Ok(cn) = std::str::from_utf8(atv.value.value()) {
-                    if cn.eq_ignore_ascii_case(expected_username) {
-                        info!(cert_path, cn, "certificate CN matches username");
-                        return Ok(());
-                    }
+                if let Ok(cn) = std::str::from_utf8(atv.value.value())
+                    && cn.eq_ignore_ascii_case(expected_username)
+                {
+                    info!(cert_path, cn, "certificate CN matches username");
+                    return Ok(());
                 }
             }
         }
@@ -152,7 +149,11 @@ fn validate_cert_identity(cert_path: &str, expected_username: &str) -> Result<()
         .iter()
         .flat_map(|rdn| rdn.0.iter())
         .filter(|atv| atv.oid.to_string() == "2.5.4.3")
-        .filter_map(|atv| std::str::from_utf8(atv.value.value()).ok().map(String::from))
+        .filter_map(|atv| {
+            std::str::from_utf8(atv.value.value())
+                .ok()
+                .map(String::from)
+        })
         .collect();
 
     Err(KmsError::CnMismatch {
@@ -239,10 +240,7 @@ fn build_kms_client(
 /// The Cosmian KMS returns object unique identifiers as UUID strings;
 /// SQL Server expects a 16-byte opaque thumbprint.
 pub fn uuid_str_to_bytes(uuid_str: &str) -> Result<[u8; 16], KmsError> {
-    let hex: String = uuid_str
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let hex: String = uuid_str.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
         return Err(KmsError::InvalidUniqueId(format!(
             "expected 32 hex digits, got {} from '{uuid_str}'",
@@ -265,11 +263,22 @@ pub fn thumbprint_to_uuid(bytes: &[u8]) -> Option<String> {
     }
     Some(format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     ))
 }
 
@@ -341,9 +350,7 @@ async fn create_symmetric_key(
 ) -> Result<String, KmsError> {
     use cosmian_kms_client::kmip_0::kmip_types::CryptographicUsageMask;
     use cosmian_kms_client::kmip_2_1::{
-        kmip_attributes::Attributes,
-        kmip_objects::ObjectType,
-        kmip_operations::Create,
+        kmip_attributes::Attributes, kmip_objects::ObjectType, kmip_operations::Create,
         kmip_types::CryptographicAlgorithm,
     };
 
@@ -384,8 +391,7 @@ async fn create_asymmetric_key_pair(
 ) -> Result<String, KmsError> {
     use cosmian_kms_client::kmip_0::kmip_types::CryptographicUsageMask;
     use cosmian_kms_client::kmip_2_1::{
-        kmip_attributes::Attributes,
-        kmip_operations::CreateKeyPair,
+        kmip_attributes::Attributes, kmip_operations::CreateKeyPair,
         kmip_types::CryptographicAlgorithm,
     };
 
@@ -449,11 +455,8 @@ pub fn destroy_key(
         .map_err(|e| KmsError::DestroyKeyError(format!("tokio runtime: {e}")))?;
 
     rt.block_on(async {
-        use cosmian_kms_client::kmip_2_1::{
-            kmip_operations::Revoke,
-            kmip_types::UniqueIdentifier,
-        };
         use cosmian_kms_client::kmip_0::kmip_types::{RevocationReason, RevocationReasonCode};
+        use cosmian_kms_client::kmip_2_1::{kmip_operations::Revoke, kmip_types::UniqueIdentifier};
 
         // Revoke first (required before Destroy on most KMIP servers)
         let revoke_req = Revoke {
@@ -490,9 +493,11 @@ pub fn destroy_key(
 
 /// Metadata about a key returned by the KMS.
 pub struct KeyInfo {
+    #[allow(unused)]
     pub unique_id: String,
     /// The provider key name (the original PROVIDER_KEY_NAME from SQL Server).
     pub key_name: String,
+    #[allow(unused)]
     pub algorithm_name: String,
     pub bit_len: u32,
     pub is_symmetric: bool,
@@ -532,8 +537,7 @@ pub fn get_key_info_by_thumb(
 
 async fn get_key_info_async(client: &KmsClient, uuid: &str) -> Result<KeyInfo, KmsError> {
     use cosmian_kms_client::kmip_2_1::{
-        kmip_operations::GetAttributes,
-        kmip_types::UniqueIdentifier,
+        kmip_operations::GetAttributes, kmip_types::UniqueIdentifier,
     };
 
     let request = GetAttributes {
@@ -589,12 +593,6 @@ async fn get_key_info_async(client: &KmsClient, uuid: &str) -> Result<KeyInfo, K
     })
 }
 
-// ---------------------------------------------------------------------------
-// Linked public key lookup
-// ---------------------------------------------------------------------------
-
-/// Resolve the public key UUID linked to a private key UUID.
-///
 // ---------------------------------------------------------------------------
 // Encryption
 // ---------------------------------------------------------------------------
@@ -706,11 +704,11 @@ async fn encrypt_symmetric_async(
     plaintext: &[u8],
     iv: Option<&[u8]>,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), KmsError> {
+    use cosmian_kms_client::kmip_0::kmip_types::BlockCipherMode;
     use cosmian_kms_client::kmip_2_1::{
         kmip_operations::Encrypt,
         kmip_types::{CryptographicAlgorithm, CryptographicParameters, UniqueIdentifier},
     };
-    use cosmian_kms_client::kmip_0::kmip_types::BlockCipherMode;
     use zeroize::Zeroizing;
 
     let crypto_params = Some(CryptographicParameters {
@@ -850,11 +848,11 @@ async fn decrypt_symmetric_async(
     ciphertext: &[u8],
     iv: Option<&[u8]>,
 ) -> Result<Vec<u8>, KmsError> {
+    use cosmian_kms_client::kmip_0::kmip_types::BlockCipherMode;
     use cosmian_kms_client::kmip_2_1::{
         kmip_operations::Decrypt,
         kmip_types::{CryptographicAlgorithm, CryptographicParameters, UniqueIdentifier},
     };
-    use cosmian_kms_client::kmip_0::kmip_types::BlockCipherMode;
 
     let crypto_params = Some(CryptographicParameters {
         block_cipher_mode: Some(BlockCipherMode::CBC),
@@ -916,10 +914,7 @@ pub fn export_public_key(
     rt.block_on(export_public_key_async(&kms_client, &uuid))
 }
 
-async fn export_public_key_async(
-    client: &KmsClient,
-    uuid: &str,
-) -> Result<Vec<u8>, KmsError> {
+async fn export_public_key_async(client: &KmsClient, uuid: &str) -> Result<Vec<u8>, KmsError> {
     use cosmian_kms_client::kmip_2_1::{
         kmip_objects::Object,
         kmip_operations::Get,

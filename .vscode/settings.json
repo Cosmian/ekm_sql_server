@@ -7,6 +7,10 @@
         "cargo check": true
     },
     "cSpell.words": [
-        "Cosmian"
+        "ciphertext",
+        "Cosmian",
+        "KMIP",
+        "OAEP",
+        "Zeroizing"
     ]
 }
