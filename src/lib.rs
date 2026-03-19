@@ -360,7 +360,7 @@ pub unsafe extern "C" fn SqlCryptOpenSession(
         let auth = &*p_auth;
         SessionCredential {
             username: sql_cp_str_to_string(&auth.name),
-            password: sql_cp_str_to_string(&auth.password),
+            // avoid storing the password - we don't need it for anything.
         }
     };
 

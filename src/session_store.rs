@@ -37,7 +37,6 @@ use tracing::{debug, info, warn};
 /// All strings are decoded UTF-8 (converted from the caller's UTF-16LE).
 pub struct SessionCredential {
     pub username: String,
-    pub password: String,
 }
 
 /// Per-session state stored in the `SessionStore`.
