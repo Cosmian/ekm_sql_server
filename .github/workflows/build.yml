@@ -1,0 +1,170 @@
+---
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  build:
+    name: Build DLL (windows-2022)
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # -----------------------------------------------------------------------
+      # Cache: Rust registry + build artefacts
+      # -----------------------------------------------------------------------
+      - name: Cache Rust build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # -----------------------------------------------------------------------
+      # Cache: vcpkg installed packages (keyed on vcpkg.json)
+      # -----------------------------------------------------------------------
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-x64-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-x64-windows-static-
+
+      # -----------------------------------------------------------------------
+      # OpenSSL via vcpkg manifest mode (triplet x64-windows-static)
+      # Overrides the hardcoded local path in .cargo/config.toml [env].
+      # -----------------------------------------------------------------------
+      - name: Install OpenSSL via vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } `
+                       elseif ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } `
+                       else { "C:\vcpkg" }
+          Write-Host "vcpkg root: $vcpkgRoot"
+          & "$vcpkgRoot\vcpkg.exe" install --triplet x64-windows-static
+          $opensslDir = Join-Path (Get-Location) "vcpkg_installed\x64-windows-static"
+          Write-Host "OPENSSL_DIR=$opensslDir"
+          echo "OPENSSL_DIR=$opensslDir"   >> $env:GITHUB_ENV
+          echo "OPENSSL_STATIC=1"          >> $env:GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # LIBCLANG_PATH — required by build.rs (bindgen 0.71 to parse sqlcrypt.h)
+      # windows-2022 runners ship LLVM pre-installed at C:\Program Files\LLVM.
+      # Falls back to the VS-bundled clang, then installs via Chocolatey.
+      # -----------------------------------------------------------------------
+      - name: Set LIBCLANG_PATH for bindgen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidates = @(
+            "C:\Program Files\LLVM\bin",
+            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
+            "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
+            "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin"
+          )
+          $llvmBin = $null
+          foreach ($c in $candidates) {
+            if (Test-Path "$c\libclang.dll") { $llvmBin = $c; break }
+          }
+          if (-not $llvmBin) {
+            Write-Host "libclang.dll not found in standard locations; installing LLVM via Chocolatey..."
+            choco install llvm -y --no-progress
+            $llvmBin = "C:\Program Files\LLVM\bin"
+          }
+          Write-Host "LIBCLANG_PATH=$llvmBin"
+          echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+      - name: Build DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . .\.github\scripts\build_ekm_dll.ps1
+          Build-EkmDll
+
+      # -----------------------------------------------------------------------
+      # Upload: DLL + PowerShell scripts (for operator signing + deployment)
+      # -----------------------------------------------------------------------
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cosmian-ekm-sql-server
+          path: |
+            target/release/cosmian_ekm_sql_server.dll
+            scripts/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish to package.cosmian.com — skipped on pull requests
+  # Uses the same self-hosted runner + Docker container pattern as the kms repo.
+  # Requires /home/cosmian/.ssh/id_rsa to be present on the self-hosted runner.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to package.cosmian.com
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, not-sgx]
+    container:
+      image: cosmian/docker_doc_ci
+      volumes:
+        - /home/cosmian/.ssh/id_rsa:/root/.ssh/id_rsa
+
+    steps:
+      - name: Download artefacts
+        uses: actions/download-artifact@v8
+        with:
+          name: cosmian-ekm-sql-server
+          path: .
+
+      - name: List downloaded files
+        run: |
+          set -ex
+          find . -type f -print
+
+      - name: Push to package.cosmian.com
+        shell: bash
+        run: |
+          set -ex
+          if [[ "${GITHUB_REF}" =~ refs/tags/(.+) ]]; then
+            BRANCH="${BASH_REMATCH[1]}"
+          else
+            HEAD_REF="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+            BRANCH="last_build/${HEAD_REF}"
+          fi
+
+          DEST_DIR="/mnt/package/ekm_sql_server/${BRANCH}/windows/x86_64"
+          ssh -o 'StrictHostKeyChecking no' -i /root/.ssh/id_rsa \
+            cosmian@package.cosmian.com mkdir -p "${DEST_DIR}/scripts"
+
+          # Upload DLL
+          DLL=$(find . -name 'cosmian_ekm_sql_server.dll' -print -quit)
+          scp -o 'StrictHostKeyChecking no' -i /root/.ssh/id_rsa \
+            "${DLL}" cosmian@package.cosmian.com:"${DEST_DIR}/"
+
+          # Upload PowerShell operator scripts (sign + deploy)
+          while IFS= read -r -d '' ps1; do
+            scp -o 'StrictHostKeyChecking no' -i /root/.ssh/id_rsa \
+              "${ps1}" cosmian@package.cosmian.com:"${DEST_DIR}/scripts/"
+          done < <(find . -name '*.ps1' -print0)
