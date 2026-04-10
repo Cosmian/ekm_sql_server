@@ -14,6 +14,20 @@ fn main() {
         .clang_arg("-Wno-macro-redefined")
         // We implement the exported functions ourselves; only generate types
         .blocklist_function(".*")
+        // bindgen opaque-izes _GUID in C++ mode; provide the correct definition manually
+        .blocklist_type("_GUID")
+        .blocklist_type("GUID")
+        .raw_line(
+            "#[repr(C)]\n\
+             #[derive(Debug, Default, Copy, Clone, Hash, PartialOrd, Ord, PartialEq, Eq)]\n\
+             pub struct _GUID {\n\
+             \x20   pub Data1: u32,\n\
+             \x20   pub Data2: u16,\n\
+             \x20   pub Data3: u16,\n\
+             \x20   pub Data4: [u8; 8usize],\n\
+             }\n\
+             pub type GUID = _GUID;",
+        )
         // Generate Rust enums for ergonomic use
         .rustified_enum(".*")
         .derive_debug(true)
