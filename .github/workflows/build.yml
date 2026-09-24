@@ -106,7 +106,7 @@ jobs:
       # -----------------------------------------------------------------------
       # Upload: unsigned DLL + PowerShell scripts
       # -----------------------------------------------------------------------
-      - name: Upload unsigned artefacts
+      - name: Upload build artefacts
         uses: actions/upload-artifact@v7
         with:
           name: cosmian-ekm-sql-server-unsigned
