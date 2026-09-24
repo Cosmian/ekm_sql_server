@@ -106,13 +106,23 @@ jobs:
       # -----------------------------------------------------------------------
       # Upload: unsigned DLL + PowerShell scripts
       # -----------------------------------------------------------------------
+      - name: Prepare build artefact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path artifact) {
+            Remove-Item -Recurse -Force artifact
+          }
+          New-Item -ItemType Directory -Path artifact\scripts -Force | Out-Null
+          Copy-Item target\release\cosmian_ekm_sql_server.dll artifact\
+          Copy-Item scripts\* artifact\scripts\ -Recurse
+
       - name: Upload build artefacts
         uses: actions/upload-artifact@v7
         with:
           name: cosmian-ekm-sql-server-unsigned
           path: |
-            target/release/cosmian_ekm_sql_server.dll
-            scripts/
+            artifact/
           retention-days: 1
           if-no-files-found: error
 
