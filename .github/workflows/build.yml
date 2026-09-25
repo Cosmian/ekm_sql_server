@@ -104,17 +104,80 @@ jobs:
           Build-EkmDll
 
       # -----------------------------------------------------------------------
-      # Upload: DLL + PowerShell scripts (for operator signing + deployment)
+      # Upload: unsigned DLL + PowerShell scripts
       # -----------------------------------------------------------------------
-      - name: Upload artefacts
+      - name: Prepare build artefact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path artifact) {
+            Remove-Item -Recurse -Force artifact
+          }
+          New-Item -ItemType Directory -Path artifact\scripts -Force | Out-Null
+          Copy-Item target\release\cosmian_ekm_sql_server.dll artifact\
+          Copy-Item scripts\* artifact\scripts\ -Recurse
+
+      - name: Upload build artefacts
         uses: actions/upload-artifact@v7
         with:
-          name: cosmian-ekm-sql-server
+          name: cosmian-ekm-sql-server-unsigned
           path: |
-            target/release/cosmian_ekm_sql_server.dll
-            scripts/
+            artifact/
           retention-days: 1
           if-no-files-found: error
+
+  sign:
+    name: Sign DLL with Azure Trusted Signing
+    needs: build
+    uses: Cosmian/reusable_scripts/.github/workflows/sign-windows-artifacts.yml@develop
+    with:
+      artifact-to-download: cosmian-ekm-sql-server-unsigned
+      files-folder: to-sign
+      files-folder-filter: dll
+      artifact-name: cosmian-ekm-sql-server-signed
+      signing-account-name: cosmian-codesigning-test
+      certificate-profile-name: cosmian-public-profile
+    secrets:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID_POC }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID_POC }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET_POC }}
+
+  verify:
+    name: Verify signed DLL
+    needs: sign
+    runs-on: windows-2022
+
+    steps:
+      - name: Download signed artefacts
+        uses: actions/download-artifact@v8
+        with:
+          name: cosmian-ekm-sql-server-signed
+          path: .
+
+      - name: Verify Authenticode signature
+        shell: pwsh
+        run: |
+          $dlls = @(Get-ChildItem -Recurse -Filter "cosmian_ekm_sql_server.dll")
+          if ($dlls.Count -ne 1) {
+            Write-Error "Expected one signed DLL, found $($dlls.Count)"
+            exit 1
+          }
+
+          $signature = Get-AuthenticodeSignature -FilePath $dlls[0].FullName
+          $signer = $signature.SignerCertificate
+          $status = "$($signature.Status)"
+          $subject = if ($null -ne $signer) { $signer.Subject } else { "<none>" }
+          Write-Host "$($dlls[0].Name): status=$status signer=$subject"
+
+          # Azure Trusted Signing test profiles can return UnknownError when
+          # the runner cannot build the public trust chain. The signer
+          # certificate is still present; reject missing certificates and
+          # cryptographic/hash failures, but allow this trust-only status.
+          $trustOnlyStatus = $signature.Status -eq "UnknownError" -and $null -ne $signer
+          if ($signature.Status -ne "Valid" -and -not $trustOnlyStatus) {
+            Write-Error "Invalid Authenticode signature: $($signature.Status)"
+            exit 1
+          }
 
   # ---------------------------------------------------------------------------
   # Publish to package.cosmian.com — skipped on pull requests
@@ -123,7 +186,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     name: Publish to package.cosmian.com
-    needs: build
+    needs: verify
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, not-sgx]
     container:
@@ -135,7 +198,7 @@ jobs:
       - name: Download artefacts
         uses: actions/download-artifact@v8
         with:
-          name: cosmian-ekm-sql-server
+          name: cosmian-ekm-sql-server-signed
           path: .
 
       - name: List downloaded files
